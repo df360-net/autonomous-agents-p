@@ -16,11 +16,14 @@ Standalone (useful before any mail server exists):
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+from html import unescape
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -51,6 +54,14 @@ SYSTEM_PROMPT = (
     "driver (`@libsql/client` + `drizzle-orm/libsql`) with a local `file:` database — do NOT "
     "use `better-sqlite3` (no native build tools). Stay inside your workspace directory; do "
     "not roam the filesystem.\n"
+    "\n"
+    "YOU ARE ONLINE. This container has real internet access — npm, pip and git all reach out "
+    "already, and so can you. Use `web_search` when the answer is something your training will "
+    "not reliably contain: a library's current API, a version that exists today, an error "
+    "message you do not recognise, whether a package is still maintained. Then read the page "
+    "itself with `curl -s <url>` in run_bash rather than trusting a snippet. Do not guess at an "
+    "API you are unsure of when you could look it up in one call — a wrong guess costs you a "
+    "build, and you will not find out until the build fails.\n"
     "\n"
     "YOU OWN THIS MACHINE AND YOU MAINTAIN IT. It is not reset between tasks and you are the "
     "only one working in it: the workspace, the files, the databases and the servers you left "
@@ -154,7 +165,7 @@ def strip_preamble(answer):
     return answer[idx + len(EMAIL_MARKER):].strip() or answer
 
 
-# ---- Tool schema — the full 4-tool menu -------------------------------------
+# ---- Tool schema — the full 6-tool menu -------------------------------------
 TOOLS_SCHEMA = [
     {
         "type": "function",
@@ -207,6 +218,56 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            # Added because the model kept calling it anyway. It invented `edit_file` in the
+            # middle of builds, got "no such tool", and fell back to run_bash with a Python
+            # heredoc doing string surgery — a wasted round-trip every time and by far the
+            # most fragile thing it did. If the model has a strong prior about a tool, the
+            # cheap fix is to provide it rather than to keep refusing.
+            "name": "edit_file",
+            "description": (
+                "Replace an exact string in a file. Prefer this over rewriting a whole file "
+                "with write_file when changing part of one. old_string must match the file "
+                "byte for byte, including indentation, and must be unique unless replace_all "
+                "is true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "old_string": {"type": "string", "description": "Exact text to find"},
+                    "new_string": {"type": "string", "description": "Text to put in its place"},
+                    "replace_all": {"type": "boolean",
+                                    "description": "Replace every occurrence (default false)"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web and return the top results as title, URL and snippet. This "
+                "container has real internet access. Use it when you need something your "
+                "training will not reliably contain: a library's current API, a version "
+                "number, an error message you do not recognise. Follow up by fetching a "
+                "promising URL with `curl -s <url>` in run_bash to read the page itself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for"},
+                    "count": {"type": "integer",
+                              "description": "How many results to return (default 8, max 20)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -251,11 +312,107 @@ def write_file(path, content):
     return f"Wrote {len(content)} chars to {path}"
 
 
+def edit_file(path, old_string, new_string, replace_all=False):
+    """Exact string replacement. Errors are returned as text, not raised — the loop feeds them
+    back to the model, which then fixes its own call. That is why each one says what to do
+    next rather than just what went wrong."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return (f"ERROR: {path} does not exist. Use write_file to create it.")
+    except OSError as e:
+        return f"ERROR: cannot read {path}: {e}"
+
+    if old_string == new_string:
+        return "ERROR: old_string and new_string are identical — nothing to do."
+    count = content.count(old_string)
+    if count == 0:
+        # The overwhelmingly common cause is whitespace, so say so instead of leaving the
+        # model to guess and retry the same string with a different quoting style.
+        return (f"ERROR: old_string was not found in {path}. It must match exactly, including "
+                f"indentation and line breaks. Read the file first and copy the text verbatim.")
+    if count > 1 and not replace_all:
+        return (f"ERROR: old_string appears {count} times in {path}. Include more surrounding "
+                f"context to make it unique, or pass replace_all=true to change all {count}.")
+
+    updated = content.replace(old_string, new_string) if replace_all \
+        else content.replace(old_string, new_string, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    line = content[:content.index(old_string)].count("\n") + 1
+    where = f"{count} occurrences" if replace_all and count > 1 else f"line {line}"
+    return f"Edited {path} at {where} ({len(content)} -> {len(updated)} chars)"
+
+
+# DuckDuckGo's no-JavaScript endpoint. Chosen because it needs no API key and no account:
+# a search tool that depends on a secret nobody has provisioned is a tool that silently does
+# not work. The HTML is scraped, so this is best-effort by nature — it reports what it got
+# rather than pretending, and run_bash + curl remains available when a page must be read.
+DDG_URL = "https://html.duckduckgo.com/html/"
+_TAG_RE = re.compile(r"<[^>]+>")
+_RESULT_RE = re.compile(
+    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>'
+    r'(?P<rest>.*?)(?=<a[^>]+class="[^"]*result__a|\Z)', re.S)
+_SNIPPET_RE = re.compile(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', re.S)
+
+
+def _clean(html_fragment):
+    return unescape(_TAG_RE.sub("", html_fragment or "")).strip()
+
+
+def _unwrap(url):
+    """DDG wraps results as /l/?uddg=<encoded>. Hand back the real URL — the model may want to
+    curl it, and a redirector is useless for that."""
+    if "uddg=" in url:
+        try:
+            return urllib.parse.unquote(urllib.parse.parse_qs(
+                urllib.parse.urlparse(url).query)["uddg"][0])
+        except Exception:
+            return url
+    return url[2:] if url.startswith("//") else url
+
+
+def web_search(query, count=8):
+    count = max(1, min(int(count or 8), 20))
+    data = urllib.parse.urlencode({"q": query}).encode()
+    req = urllib.request.Request(DDG_URL, data=data, headers={
+        # Without a browser UA this endpoint returns an empty result set rather than an error.
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            html = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return f"ERROR: search returned HTTP {e.code}. Try `curl -s <url>` in run_bash instead."
+    except (urllib.error.URLError, OSError) as e:
+        return f"ERROR: could not reach the search engine ({e}). The network may be down."
+
+    out = []
+    for m in _RESULT_RE.finditer(html):
+        title, url = _clean(m.group("title")), _unwrap(m.group("url"))
+        if not title or not url.startswith("http"):
+            continue
+        snip = _SNIPPET_RE.search(m.group("rest"))
+        out.append(f"{len(out) + 1}. {title}\n   {url}"
+                   + (f"\n   {_clean(snip.group(1))[:300]}" if snip else ""))
+        if len(out) >= count:
+            break
+    if not out:
+        return ("No results parsed. The search page may have changed shape; fetch a URL "
+                "directly with `curl -s <url>` in run_bash instead.")
+    return f"Top {len(out)} results for {query!r}:\n\n" + "\n\n".join(out)
+
+
 DISPATCH = {
     "read_file": read_file,
     "list_dir": list_dir,
     "run_bash": run_bash,
     "write_file": write_file,
+    "edit_file": edit_file,
+    "web_search": web_search,
 }
 
 
