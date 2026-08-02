@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -62,6 +63,12 @@ SYSTEM_PROMPT = (
     "itself with `curl -s <url>` in run_bash rather than trusting a snippet. Do not guess at an "
     "API you are unsure of when you could look it up in one call — a wrong guess costs you a "
     "build, and you will not find out until the build fails.\n"
+    "`web_search` scrapes a public search engine, so it is best-effort: a burst of queries "
+    "gets the container rate-limited and it will say SEARCH BLOCKED. That is not a bug and "
+    "retrying will not help — the block is by IP and hammering it makes it last longer. Read "
+    "the alternatives it prints and use curl instead. Fetching a URL directly is always more "
+    "reliable than searching for it: RSS feeds, a project's own docs, api.github.com, "
+    "registry.npmjs.org and raw.githubusercontent.com have never been blocked here.\n"
     "\n"
     "YOU OWN THIS MACHINE AND YOU MAINTAIN IT. It is not reset between tasks and you are the "
     "only one working in it: the workspace, the files, the databases and the servers you left "
@@ -373,8 +380,50 @@ def _unwrap(url):
     return url[2:] if url.startswith("//") else url
 
 
+# Scraping a search engine is best-effort and WILL be refused sometimes. DuckDuckGo answers a
+# rate-limited client with HTTP 202 and a ~14KB challenge page rather than an error status, so
+# a naive reader sees "success, no results" and reports the wrong thing — which is exactly what
+# this tool did on its first real outing: it told the agent the page had "changed shape" while
+# the truth was a burst of queries had tripped the limiter.
+BLOCK_MARKERS = ("unusual traffic", "anomaly", "captcha", "challenge-form", "/challenge")
+SEARCH_MIN_INTERVAL = 4.0        # seconds between searches; a burst is what trips the limiter
+_last_search_at = [0.0]
+
+# What to do instead, when search is unavailable. Concrete and checked: every one of these was
+# reachable from this container when the search engines were refusing.
+SEARCH_FALLBACK_ADVICE = (
+    "Search is unavailable right now, but the network is fine and you have other routes:\n"
+    "  - News:  curl -s 'https://news.google.com/rss/search?q=YOUR+TOPIC&hl=en-US&gl=US&ceid=US:en'\n"
+    "           Plain XML, ~100 items, no key. But the item <link> does NOT reach the article:\n"
+    "           it is a Google redirect that serves a JavaScript shell, and `curl -sL` lands on\n"
+    "           news.google.com with no story in it. Use the item's <source url=\"…\"> to learn\n"
+    "           the PUBLISHER, then fetch that publisher's own feed (usually /feed or /rss) and\n"
+    "           match on the headline to get the real article URL.\n"
+    "  - A project's own docs, if you can guess the URL: `curl -s https://…` usually works.\n"
+    "  - GitHub:     https://api.github.com/search/repositories?q=…  and raw.githubusercontent.com\n"
+    "  - npm:        https://registry.npmjs.org/<package>   (JSON: versions, repo, homepage)\n"
+    "  - Wikipedia:  https://en.wikipedia.org/w/api.php?action=opensearch&format=json&search=…\n"
+    "Use run_bash with curl for these. Do NOT retry web_search in a loop — the block is by IP "
+    "and retrying makes it last longer."
+)
+
+
+def _search_blocked(status, html):
+    """A refusal dressed as a success. Detected on the response, not on the absence of results,
+    so 'genuinely nothing matched' stays distinguishable from 'we were turned away'."""
+    if status == 202:
+        return True
+    low = html.lower()
+    return any(m in low for m in BLOCK_MARKERS) and "result__a" not in html
+
+
 def web_search(query, count=8):
     count = max(1, min(int(count or 8), 20))
+    wait = SEARCH_MIN_INTERVAL - (time.monotonic() - _last_search_at[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_search_at[0] = time.monotonic()
+
     data = urllib.parse.urlencode({"q": query}).encode()
     req = urllib.request.Request(DDG_URL, data=data, headers={
         # Without a browser UA this endpoint returns an empty result set rather than an error.
@@ -385,10 +434,18 @@ def web_search(query, count=8):
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             html = r.read().decode("utf-8", "replace")
+            status = r.status
     except urllib.error.HTTPError as e:
-        return f"ERROR: search returned HTTP {e.code}. Try `curl -s <url>` in run_bash instead."
+        if e.code in (429, 403):
+            return f"SEARCH BLOCKED (HTTP {e.code} — rate limited).\n\n{SEARCH_FALLBACK_ADVICE}"
+        return (f"ERROR: search returned HTTP {e.code}.\n\n{SEARCH_FALLBACK_ADVICE}")
     except (urllib.error.URLError, OSError) as e:
         return f"ERROR: could not reach the search engine ({e}). The network may be down."
+
+    if _search_blocked(status, html):
+        return (f"SEARCH BLOCKED — the engine served a bot challenge instead of results "
+                f"(HTTP {status}). This is rate limiting, not a bad query, and it clears on "
+                f"its own after a while.\n\n{SEARCH_FALLBACK_ADVICE}")
 
     out = []
     for m in _RESULT_RE.finditer(html):
@@ -401,8 +458,8 @@ def web_search(query, count=8):
         if len(out) >= count:
             break
     if not out:
-        return ("No results parsed. The search page may have changed shape; fetch a URL "
-                "directly with `curl -s <url>` in run_bash instead.")
+        return (f"No results for {query!r}. The query may be too specific — try fewer words, "
+                f"or drop the quotes if you used an exact phrase.\n\n{SEARCH_FALLBACK_ADVICE}")
     return f"Top {len(out)} results for {query!r}:\n\n" + "\n\n".join(out)
 
 
