@@ -182,7 +182,12 @@ metadata:
   namespace: {ns}
   labels: {{ app: {app}, managed-by: agent1 }}
 spec:
-  replicas: 2
+  # ONE replica by default, on purpose. Two pods do not share a filesystem, a SQLite file or
+  # an in-process WebSocket hub — they are two separate copies of the application, and a user
+  # gets whichever one their connection happens to land on. Raise this to 2 only if every
+  # request can be served by any pod with no shared state; `ship_app push` blocks the
+  # combination of replicas > 1 and a local database, because that has shipped broken twice.
+  replicas: 1
   selector:
     matchLabels: {{ app: {app} }}
   template:
@@ -235,6 +240,150 @@ def manifest_example(app, index, container_port=8080, health="/healthz"):
         app=slug(app), ns=K8S_NAMESPACE, container_port=container_port,
         health=health, node_port=ports_for(index)["node"],
     )
+
+
+# ---- The multi-replica guard: a safety property in Python, not in the prompt ----------
+# Two apps in a row shipped `replicas: 2` over a SQLite file in the pod's own filesystem
+# (url-shortener, then sprintflow). Both were "working" when the agent tested them, because a
+# single client with one keep-alive connection stays pinned to one pod. Both were broken for
+# real users: two pods, two databases, two in-process WebSocket hubs, and the Service hands
+# out whichever one the next connection lands on. The url-shortener returned 404 for half the
+# links it had just minted; sprintflow served two entirely different boards.
+#
+# The agent cannot be trusted to remember this and neither can a prompt line — it had already
+# written the SQLite lesson into its own AGENT-AVOID.md and still did it. So the check runs
+# here, at the one point of no return, and it reads the app's real dependencies rather than
+# asking anybody's opinion.
+
+# Only dependency declarations and imports are searched, never arbitrary source text: a
+# pattern like r"\.db\b" would match `this.db` in every ORM in existence.
+SQLITE_DEPS = (
+    ("better-sqlite3", "better-sqlite3"),
+    ("@libsql/client", "@libsql/client"),
+    ("drizzle-orm/libsql", "drizzle-orm on libsql"),
+    ("node:sqlite", "node:sqlite"),
+    ("sqlite3", "sqlite3"),
+    ("aiosqlite", "aiosqlite"),
+    ("sqlalchemy", "SQLAlchemy (check its URL — sqlite:/// is local)"),
+)
+DEP_FILES = ("package.json", "requirements.txt", "pyproject.toml", "Pipfile", "go.mod", "Gemfile")
+SQLITE_IN_CODE = re.compile(r"import\s+sqlite3\b|sqlite3\.connect\(|sqlite:///|file:[^\s\"']*\.(?:db|sqlite3?)\b")
+DB_FILE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+SKIP_DIRS = {"node_modules", ".git", "dist", "build", "__pycache__", ".venv", "venv"}
+
+
+def _read(path, cap=200_000):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(cap)
+    except OSError:
+        return ""
+
+
+def local_state_evidence(directory, max_files=400):
+    """Signs that this app keeps its data inside its own container.
+
+    Deliberately narrow. A false positive blocks a legitimate push, so this looks only at
+    declared dependencies, unambiguous connect calls, and database files actually sitting on
+    disk — not at prose, comments or variable names.
+    """
+    found = []
+    for name in DEP_FILES:
+        text = _read(os.path.join(directory, name))
+        if not text:
+            continue
+        low = text.lower()
+        for needle, label in SQLITE_DEPS:
+            if needle.lower() in low:
+                found.append(f"{label} (declared in {name})")
+    seen = 0
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")]
+        for fn in files:
+            if fn.lower().endswith(DB_FILE_SUFFIXES):
+                rel = os.path.relpath(os.path.join(root, fn), directory)
+                found.append(f"{rel} — a database file in the image's own filesystem")
+                continue
+            if seen >= max_files or not fn.endswith((".py", ".js", ".ts", ".mjs", ".cjs")):
+                continue
+            seen += 1
+            if SQLITE_IN_CODE.search(_read(os.path.join(root, fn), 60_000)):
+                rel = os.path.relpath(os.path.join(root, fn), directory)
+                found.append(f"a local SQLite connection in {rel}")
+    # Order-stable dedupe: the message reads better without repeats, and every walk of the
+    # same tree must produce the same text or the agent sees phantom changes between pushes.
+    out = []
+    for item in found:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def manifest_paths(directory):
+    k8s = os.path.join(directory, "k8s")
+    if not os.path.isdir(k8s):
+        return []
+    return sorted(os.path.join(k8s, f) for f in os.listdir(k8s)
+                  if f.endswith((".yaml", ".yml")))
+
+
+def declared_replicas(text):
+    """The largest `replicas:` in a manifest, or None. Comments are stripped first so the
+    explanatory note above the field cannot be mistaken for the field."""
+    best = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        m = re.match(r"\s*replicas:\s*(\d+)\s*$", line)
+        if m:
+            n = int(m.group(1))
+            best = n if best is None else max(best, n)
+    return best
+
+
+def has_shared_or_owned_storage(text):
+    """True when the manifest already answers the question honestly — either every pod talks
+    to storage outside itself, or it is a StatefulSet where owning a private volume is the
+    point. Either way this guard has nothing to say."""
+    return bool(re.search(r"kind:\s*StatefulSet|persistentVolumeClaim|volumeClaimTemplates",
+                          text))
+
+
+def replica_state_conflict(directory):
+    """The guard. Returns an explanatory string to refuse the push with, or None to allow it."""
+    manifests = manifest_paths(directory)
+    if not manifests:
+        return None
+    for path in manifests:
+        text = _read(path)
+        n = declared_replicas(text)
+        if n is None or n <= 1 or has_shared_or_owned_storage(text):
+            continue
+        evidence = local_state_evidence(directory)
+        if not evidence:
+            continue
+        rel = os.path.relpath(path, directory)
+        bullets = "\n".join(f"    - {e}" for e in evidence)
+        return (
+            f"refusing to push: {rel} asks for {n} replicas, but this app keeps its state "
+            f"inside its own container.\n\n"
+            f"  local state found:\n{bullets}\n\n"
+            f"  Kubernetes will run {n} pods from that manifest. They do not share a "
+            "filesystem, so they do not share that database, and they do not share "
+            "in-process state such as a WebSocket hub. The Service hands each new connection "
+            "to whichever pod it likes, so users are silently served different copies of the "
+            "application with different data. Your own testing will not show it: one client "
+            "holding one keep-alive connection stays pinned to one pod, which is exactly why "
+            "this has shipped broken before.\n\n"
+            "  Fix it one of these ways, then push again:\n"
+            "    replicas: 1            correct for anything backed by SQLite or a local "
+            "file. Choose this unless you have a specific reason not to.\n"
+            "    a shared database      Postgres or similar, reached over the network by "
+            "every pod, so there is one copy of the data.\n"
+            "    StatefulSet + PVC      only when each pod is genuinely meant to own its own "
+            "slice of the data.\n\n"
+            "  Then write down what you chose and why in AGENT-AVOID.md."
+        )
+    return None
 
 
 def claimed_indexes(assets_text):

@@ -171,6 +171,12 @@ def cmd_push(app, directory, message=None):
         die("no Dockerfile in that directory — CI has nothing to build. Write one first.")
     if not os.path.exists(os.path.join(directory, ".github", "workflows", "ci.yml")):
         die("no .github/workflows/ci.yml — run `ship_app scaffold` first.")
+    # Refuse a manifest that would deploy several pods over a database only one of them can
+    # see. This is a property of the delivery system, not advice: two apps shipped that exact
+    # bug while their author believed they had tested it. See agent_delivery.replica_state_conflict.
+    conflict = d.replica_state_conflict(directory)
+    if conflict:
+        die(conflict)
 
     _ensure_repo(repo)
     env, helper = git_env()
