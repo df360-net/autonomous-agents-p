@@ -1,0 +1,133 @@
+# Phase 0: one agent, tasked by email. Three containers on one bridge network.
+#
+#   you (browser) -> roundcube -> mailserver <- agent-worker (IMAP poll / SMTP reply)
+#
+# LAN-only: no external domain, no DNS, no real TLS. `agents.local` exists only inside
+# this compose network. That is deliberate for the MVP — see README.
+
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: mailserver
+    hostname: mail.agents.local
+    environment:
+      - POSTMASTER_ADDRESS=postmaster@agents.local
+      - SSL_TYPE=                      # no TLS: LAN-only MVP
+      - PERMIT_DOCKER=connected-networks   # trust the bridge -> containers may relay on :25
+      - ENABLE_FAIL2BAN=0
+      - ENABLE_CLAMAV=0
+      - ENABLE_RSPAMD=0
+      - ENABLE_OPENDKIM=0
+      - ENABLE_OPENDMARC=0
+      - ENABLE_POLICYD_SPF=0
+      - SPOOF_PROTECTION=0
+      - LOG_LEVEL=info
+    ports:
+      - "1025:25"      # so you can drive it from the laptop (scripts/task_agent.py)
+      - "1143:143"
+    volumes:
+      # NAMED volumes, not host paths. Zeenie is Windows: docker-mailserver's data and
+      # state on a Windows bind mount breaks Postfix — postscreen dies with SIGSEGV on a
+      # missing postscreen_cache.db and port 25 silently stops accepting mail. Only the
+      # config dir is bind-mounted, because we author those files (and the accounts we
+      # create with `setup email add` land in ./config/dms/postfix-accounts.cf, so they
+      # survive a `compose down` even though the mail store does not).
+      - dms-mail-data:/var/mail/
+      - dms-mail-state:/var/mail-state/
+      - dms-mail-logs:/var/log/mail/
+      - ./config/dms/:/tmp/docker-mailserver/
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      # The image defines no healthcheck, and depends_on: service_healthy needs one.
+      # Check BOTH ports: 143 alone reports healthy while Postfix is dead on 25, which is
+      # exactly how the postscreen/bind-mount failure hid itself the first time.
+      test: ["CMD-SHELL", "ss -lnt | grep -q ':143 ' && ss -lnt | grep -q ':25 '"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: roundcube
+    depends_on:
+      mailserver:
+        condition: service_healthy
+    environment:
+      - ROUNDCUBEMAIL_DEFAULT_HOST=mailserver
+      - ROUNDCUBEMAIL_DEFAULT_PORT=143
+      - ROUNDCUBEMAIL_SMTP_SERVER=mailserver
+      - ROUNDCUBEMAIL_SMTP_PORT=25
+      - ROUNDCUBEMAIL_DB_TYPE=sqlite
+    volumes:
+      # Forces unauthenticated SMTP on :25. Without this Roundcube reuses your IMAP
+      # credentials to AUTH, which Postfix won't offer over an unencrypted connection.
+      - ./config/roundcube/custom.inc.php:/var/roundcube/config/custom.inc.php:ro
+      - roundcube-db:/var/roundcube/db/     # sqlite on a Windows bind mount: same trap
+    ports:
+      - "8080:80"      # http://<zeenie-ip>:8080 — the user's inbox UI
+    restart: unless-stopped
+
+  agent-worker:
+    build: .
+    container_name: agent1
+    depends_on:
+      mailserver:
+        condition: service_healthy
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - AGENT_NAME=agent1
+      - AGENT_ADDRESS=agent1@agents.local
+      - AGENT_PASSWORD=${AGENT1_PASSWORD:?set AGENT1_PASSWORD in .env}
+      # The reviewer only ever sends (relayed on :25 by a trusted container), so it needs an
+      # address but no password — it has no inbox to read.
+      - VALIDATOR_NAME=validator1
+      - VALIDATOR_ADDRESS=validator1@agents.local
+      - VALIDATION_ROUNDS=${VALIDATION_ROUNDS:-3}
+      - IMAP_HOST=mailserver
+      - IMAP_PORT=143
+      - SMTP_HOST=mailserver
+      - SMTP_PORT=25
+      - POLL_SECONDS=${POLL_SECONDS:-20}
+      - MAX_STEPS=${MAX_STEPS:-200}
+      # Where to tell you the app is. Must be an address YOUR browser can reach — the
+      # container's own hostname is useless to you, so this is Zeenie's LAN IP.
+      - APP_HOST=${APP_HOST:-192.168.0.21}
+      # Delivery: how the agent ships an app down the real CI/CD pipeline instead of leaving
+      # a dev server running. Needs a PAT with `repo` AND `workflow` scope — without the
+      # latter, GitHub rejects any push touching .github/workflows/ with a misleading error.
+      # Unset = the agent is told delivery is unavailable and must say so rather than pretend.
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_OWNER=${GITHUB_OWNER:-df360-net}
+      - K8S_NAMESPACE=${K8S_NAMESPACE:-agent-apps}
+      - NODE_PORT_BASE=${NODE_PORT_BASE:-30000}
+      - PROXY_PORT_BASE=${PROXY_PORT_BASE:-31000}
+      # Local preview ports: where the agent runs an app while BUILDING it. Bounded by what
+      # this container publishes below — APP_PORT_RANGE must cover BASE..BASE+COUNT-1, and
+      # the worker refuses to start quietly if it does not (Compose cannot do the arithmetic,
+      # so the check lives in agent_worker.main).
+      - APP_PORT_BASE=${APP_PORT_BASE:-3000}
+      - APP_PORT_COUNT=${APP_PORT_COUNT:-10}
+      - APP_PORT_RANGE=${APP_PORT_RANGE:-3000-3009}
+      # Cluster app slots — a DIFFERENT number. A preview costs a published port here; a
+      # cluster slot costs only a NodePort and a listener in agent-app-proxy, so this can be
+      # much larger. Must match the range agent-app-proxy publishes (31000-31019 at 20).
+      - APP_SLOT_COUNT=${APP_SLOT_COUNT:-20}
+    ports:
+      # Apps the agent builds live here while it tests them. One port per task, reclaimed when
+      # nothing is listening. Keep in step with APP_PORT_BASE/APP_PORT_COUNT above.
+      - "${APP_PORT_RANGE:-3000-3009}:${APP_PORT_RANGE:-3000-3009}"
+    volumes:
+      # Named volume, not a bind mount: the agent's builds are container-owned. Inspect
+      # them with `docker exec -it agent1 bash`, or `docker cp` anything worth keeping.
+      - agent1-workspace:/workspace
+    restart: unless-stopped
+
+volumes:
+  agent1-workspace:
+  dms-mail-data:
+  dms-mail-state:
+  dms-mail-logs:
+  roundcube-db:

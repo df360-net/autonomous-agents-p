@@ -1,0 +1,6 @@
+.env
+docker-data/
+__pycache__/
+*.pyc
+tests/ws*/
+tests/out*/
