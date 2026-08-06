@@ -104,6 +104,7 @@ def git_env():
 
 # ---- commands ---------------------------------------------------------------
 def cmd_scaffold(app, directory):
+    _check_app_name(app)
     repo = d.repo_name(app)
     idx = _index_for(app)
     os.makedirs(os.path.join(directory, ".github", "workflows"), exist_ok=True)
@@ -145,12 +146,50 @@ def _index_for(app):
     return 0
 
 
+def _check_app_name(app):
+    """Refuse an app name that is really a REPO name.
+
+    `push` creates the repository when it does not exist, which is right for a new app and
+    dangerous for a typo: there is no confirmation step and no undo. It happened — the agent
+    passed `agent-expense-tracker` (the repo) where the app name was wanted, `repo_name()`
+    prefixed it again, and `github.com/df360-net/agent-agent-expense-tracker` was created and
+    pushed to. Nothing failed, nothing warned, and the token cannot delete a repository.
+
+    So the harness rejects the shapes that can only be mistakes, rather than trusting the
+    caller to keep two similar strings straight.
+    """
+    raw = (app or "").strip()
+    if not raw:
+        die("no app name given.")
+    low = raw.lower()
+    if low.startswith("agent-") or low.startswith("agent_"):
+        die(f"{raw!r} looks like a REPOSITORY name, not an app name.\n"
+            f"  Pass the app: `ship_app push {raw[6:] or '<app>'} <dir>`\n"
+            f"  ship_app adds the 'agent-' prefix itself — passing it again would create "
+            f"github.com/{OWNER}/agent-{d.slug(raw)}, a second empty repository.")
+    if "/" in raw or raw.endswith(".git") or "github.com" in low:
+        die(f"{raw!r} is a URL or path, not an app name. Pass the bare app name, e.g. "
+            f"`ship_app push expense-tracker <dir>`.")
+
+
 def _ensure_repo(repo):
     existing = api(f"/repos/{OWNER}/{repo}")
     if existing:
         print(f"repo github.com/{OWNER}/{repo} already exists")
         return existing
-    print(f"creating github.com/{OWNER}/{repo} ...")
+    # Creating a repo is the one irreversible thing this tool does — the PAT has no
+    # delete_repo scope, so a mistake here needs a human with admin. Make it loud rather than
+    # a single quiet line in the middle of a long build log.
+    others = _existing_app_repos()
+    print("=" * 72)
+    print(f"CREATING A NEW GITHUB REPOSITORY: {OWNER}/{repo}")
+    if others:
+        print("You already own these agent repos — if one of them is what you meant,")
+        print("stop and push to that app name instead:")
+        for name in others:
+            print(f"    {name}")
+    print("A repository cannot be deleted with this token. Only continue for a NEW app.")
+    print("=" * 72)
     created = api("/user/repos", "POST", {
         "name": repo,
         "description": "Built and maintained by agent1.",
@@ -164,6 +203,7 @@ def _ensure_repo(repo):
 
 
 def cmd_push(app, directory, message=None):
+    _check_app_name(app)
     repo = d.repo_name(app)
     if not os.path.isdir(directory):
         die(f"{directory} is not a directory")
@@ -219,6 +259,11 @@ def _write_gitignore(directory):
     print(f"wrote {path}")
 
 
+def _existing_app_repos():
+    repos = api("/user/repos?per_page=100&sort=updated") or []
+    return sorted(r["name"] for r in repos if r["name"].startswith("agent-"))
+
+
 def _latest_run(repo):
     runs = api(f"/repos/{OWNER}/{repo}/actions/runs?per_page=1")
     if not runs or not runs.get("workflow_runs"):
@@ -227,6 +272,9 @@ def _latest_run(repo):
 
 
 def cmd_status(app):
+    # Also checked on the read-only commands: without it a double-prefixed name reports
+    # "no CI run yet", which reads like a slow build rather than a wrong name.
+    _check_app_name(app)
     repo = d.repo_name(app)
     run_ = _latest_run(repo)
     if not run_:
@@ -252,6 +300,7 @@ def cmd_status(app):
 
 
 def cmd_logs(app, tail=120):
+    _check_app_name(app)
     repo = d.repo_name(app)
     run_ = _latest_run(repo)
     if not run_:
