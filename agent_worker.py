@@ -182,7 +182,11 @@ def build_report(result, workspace, review=None):
         strip_preamble(result["answer"]),
         "",
         "-" * 60,
-        f"run: {verdict} in {result['steps']} steps, {len(result['transcript'])} tool calls",
+        # `steps` is None when the crash happened outside the step loop and the count is
+        # genuinely unknown. Say so rather than printing a number that is not true.
+        (f"run: {verdict} in {result['steps']} steps, {len(result['transcript'])} tool calls"
+         if result.get("steps") is not None
+         else f"run: {verdict} — step count unknown (crashed outside the step loop)"),
     ]
     if review:
         parts.append(
@@ -371,8 +375,14 @@ def handle_message(raw, seq):
     except Exception:
         tb = traceback.format_exc()
         log(f"worker crashed running the task:\n{tb}")
-        result = {"answer": f"The run crashed before finishing:\n\n{tb}",
-                  "steps": 0, "transcript": [], "stopped": "error"}
+        # Last resort only — agent_loop now returns a result rather than raising, so reaching
+        # here means something outside the step loop broke. Do not claim "0 steps": this
+        # message once accompanied a task that had already committed, pushed and deployed a
+        # fix, and the contradiction sent the reader looking for a problem that did not exist.
+        result = {"answer": f"The run crashed before finishing:\n\n{tb}\n\n"
+                            f"Any work completed before the crash is still in {workspace} — "
+                            f"check there before assuming the task did nothing.",
+                  "steps": None, "transcript": [], "stopped": "error"}
         review = None
 
     # Diagnostic only — nothing depends on it, but "did it keep its own notes up to date?" is

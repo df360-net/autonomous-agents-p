@@ -14,8 +14,10 @@ Standalone (useful before any mail server exists):
     DEEPSEEK_API_KEY=... python agent_brain.py "build a tic-tac-toe web app"
 """
 
+import http.client
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -479,26 +481,64 @@ class LLMError(RuntimeError):
     inbox loop emails the failure back rather than killing the worker)."""
 
 
+# Statuses worth trying again. Everything else (400 bad request, 401 bad key) will fail
+# identically no matter how many times it is sent, and retrying only delays the real message.
+RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+LLM_ATTEMPTS = int(os.environ.get("LLM_ATTEMPTS", "4"))
+
+
 def call_llm(messages):
+    """One completion, retried through transient failures.
+
+    WHY THE RETRY EXISTS. The first version caught HTTPError and URLError only — the errors
+    raised while *sending*. A dropped connection while *reading* the response body raises
+    http.client.IncompleteRead, which is neither, so it escaped this function entirely, past
+    the caller's `except LLMError`, and killed the whole run. It cost a completed build: the
+    agent had already fixed a bug, committed, pushed and passed CI when the socket dropped,
+    and the failure mail claimed nothing had happened.
+
+    A chat completion is safe to repeat — it has no side effects on their end and ours are
+    all in the tool loop, which has not run yet at this point. So the cheap fix is to try
+    again rather than discard an expensive multi-step run over a blip.
+    """
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise LLMError("DEEPSEEK_API_KEY is not set in the environment.")
     payload = json.dumps({"model": MODEL, "messages": messages, "tools": TOOLS_SCHEMA}).encode("utf-8")
-    req = urllib.request.Request(
-        DEEPSEEK_URL,
-        data=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:500]
-        raise LLMError(f"DeepSeek HTTP {e.code}: {detail}") from None
-    except urllib.error.URLError as e:
-        raise LLMError(f"Cannot reach DeepSeek: {e.reason}") from None
-    return json.loads(body)["choices"][0]["message"]
+    last = "no attempt made"
+
+    for attempt in range(1, LLM_ATTEMPTS + 1):
+        # Rebuilt per attempt: a Request that has already been sent cannot be reused.
+        req = urllib.request.Request(
+            DEEPSEEK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                body = resp.read()
+            return json.loads(body)["choices"][0]["message"]
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            if e.code not in RETRY_STATUSES:
+                raise LLMError(f"DeepSeek HTTP {e.code}: {detail}") from None
+            last = f"HTTP {e.code}: {detail[:200]}"
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            # IncompleteRead and RemoteDisconnected live under HTTPException; connection
+            # resets and timeouts under OSError. This is the family that used to escape.
+            last = f"{type(e).__name__}: {e}"
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            # A truncated or unexpected body. Same cause as above most of the time.
+            last = f"malformed response ({type(e).__name__}: {e})"
+
+        if attempt < LLM_ATTEMPTS:
+            delay = min(2 ** attempt, 30) + random.uniform(0, 1)
+            print(f"[llm] {last} — attempt {attempt}/{LLM_ATTEMPTS} failed, "
+                  f"retrying in {delay:.1f}s", flush=True)
+            time.sleep(delay)
+
+    raise LLMError(f"DeepSeek failed {LLM_ATTEMPTS} times in a row. Last error: {last}")
 
 
 # ---- The heart: the agent loop ----------------------------------------------
@@ -540,8 +580,20 @@ def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages
             msg = call_llm(messages)
         except LLMError as e:
             emit(f"LLM ERROR: {e}")
-            return {"answer": f"Run aborted: {e}", "steps": step, "transcript": transcript,
-                    "stopped": "error", "messages": messages}
+            return {"answer": f"Run aborted at step {step}: {e}", "steps": step,
+                    "transcript": transcript, "stopped": "error", "messages": messages}
+        except Exception as e:
+            # Nothing should reach here now that call_llm catches its own transients, but an
+            # unexpected error must still not throw away the record of what was done. When
+            # this escaped to the worker, the failure mail said "aborted in 0 steps, 0 tool
+            # calls" for a run that had already shipped a fix — the report contradicted the
+            # commit history. Whatever happens, the step count and transcript are real.
+            emit(f"UNEXPECTED ERROR at step {step}: {type(e).__name__}: {e}")
+            return {"answer": f"Run aborted at step {step} by an unexpected "
+                              f"{type(e).__name__}: {e}\n\nWork completed before this point "
+                              f"is still in the workspace.",
+                    "steps": step, "transcript": transcript, "stopped": "error",
+                    "messages": messages}
         messages.append(msg)
 
         tool_calls = msg.get("tool_calls")
