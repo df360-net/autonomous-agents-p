@@ -280,9 +280,17 @@ ATTACH_MAX_BYTES = int(os.environ.get("ATTACH_MAX_BYTES", str(2 * 1024 * 1024)))
 ATTACH_MAX_TOTAL = int(os.environ.get("ATTACH_MAX_TOTAL", str(8 * 1024 * 1024)))
 ATTACH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist",
                     "build", ".next", "target", ".cache", "coverage", ".pytest_cache"}
+# The agent's own memory, which it rewrites on almost every task, and the harness's state.
+# Mailing these back would attach three files nobody asked for to every single reply.
+ATTACH_SKIP_NAMES = {"AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md", ".processed.json"}
+# Live application data, not deliverables. Apps built by earlier tasks keep serving inside this
+# container, so a request arriving mid-run touches their database — and an expense tracker's
+# sqlite file must never be posted to anyone because the timestamp made it look fresh.
+ATTACH_SKIP_EXTS = {".log", ".pid", ".lock", ".sock", ".pyc", ".db", ".db-journal", ".db-wal",
+                    ".db-shm", ".sqlite", ".sqlite3"}
 
 
-def collect_attachments(workspace, since):
+def collect_attachments(root, since):
     """Everything the task produced, ready to hang on the reply.
 
     Returns (files, note): files is [(filename, bytes)], note is a line for the report — or
@@ -292,12 +300,20 @@ def collect_attachments(workspace, since):
     The directory is the evidence, not the transcript. The book in task 0030 was appended with
     six `cat >>` heredocs through run_bash, so a list built from write_file calls would have
     captured only its first 3,722 characters and looked complete while being a third of a book.
+
+    `root` is the whole workspace root, NOT the current task's folder. The agent is told to
+    work on existing things where they already live, so the follow-up task that corrected that
+    same book edited it in task-0030's directory while running as task-0031 — scoped to the new
+    folder this function would have found nothing and attached nothing, on the very task whose
+    entire purpose was to hand back a corrected file.
     """
     candidates = []
-    for root, dirs, names in os.walk(workspace):
+    for parent, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in ATTACH_SKIP_DIRS and not d.startswith(".")]
         for name in names:
-            path = os.path.join(root, name)
+            if name in ATTACH_SKIP_NAMES or os.path.splitext(name)[1].lower() in ATTACH_SKIP_EXTS:
+                continue
+            path = os.path.join(parent, name)
             try:
                 st = os.stat(path)
             except OSError:
@@ -317,9 +333,20 @@ def collect_attachments(workspace, since):
         return [], (f"NOT ATTACHED: the task produced {len(candidates)} files — too many to "
                     f"attach. They are in the workspace, and any app was shipped to GitHub.")
 
-    files, skipped, total = [], [], 0
+    files, skipped, total, used = [], [], 0, set()
     for path, size, _ in sorted(candidates, key=lambda c: -c[2]):
-        rel = os.path.relpath(path, workspace).replace(os.sep, "_")
+        # The plain filename, because that is what the recipient wants to save. Only when two
+        # files would land on the same name does it grow a qualifier — scanning the whole
+        # workspace root means index.html from two different tasks can genuinely collide, and
+        # one silently overwriting the other in someone's downloads folder is a real loss.
+        rel = os.path.basename(path)
+        if rel in used:
+            rel = f"{os.path.basename(os.path.dirname(path))}_{rel}"
+        n = 2
+        while rel in used:
+            stem, ext = os.path.splitext(rel)
+            rel, n = f"{stem}-{n}{ext}", n + 1
+        used.add(rel)
         if size > ATTACH_MAX_BYTES:
             skipped.append(f"{rel} ({size // 1024} KB, over the {ATTACH_MAX_BYTES // 1024} KB "
                            f"per-file limit)")
@@ -483,7 +510,9 @@ def handle_message(raw, seq):
     # let a failure here cost the reply itself — an email with no attachment still carries the
     # answer, whereas an exception on the way to the wire loses the whole run.
     try:
-        attachments, attach_note = collect_attachments(workspace, started)
+        # WORKSPACE_ROOT, not `workspace`: work on an existing thing happens in the folder that
+        # thing already lives in, which is a different task's folder than this one.
+        attachments, attach_note = collect_attachments(WORKSPACE_ROOT, started)
         if attachments:
             log(f"attaching {len(attachments)} file(s): "
                 + ", ".join(n for n, _ in attachments))

@@ -134,15 +134,57 @@ check("the oversize file is skipped", [n for n, _ in files] == ["summary.txt"],
       f"got {[n for n, _ in files]}")
 check("  ...and the reader is told it was skipped", "dump.bin" in note and "NOT ATTACHED" in note)
 
-# Nested paths flatten, so two index.js files cannot collide into one attachment.
+# A nested file keeps its plain name — that is what the recipient saves it as.
 NEST = os.path.join(os.path.dirname(__file__), "ws3", "task-nest")
 shutil.rmtree(NEST, ignore_errors=True)
 os.makedirs(os.path.join(NEST, "report"))
 with open(os.path.join(NEST, "report", "chapter1.md"), "w") as fh:
     fh.write("# one")
 files, _ = agent_worker.collect_attachments(NEST, started)
-check("nested files keep a unique, readable name", [n for n, _ in files] == ["report_chapter1.md"],
+check("a nested file keeps its plain filename", [n for n, _ in files] == ["chapter1.md"],
       f"got {[n for n, _ in files]}")
+
+# ...until two of them would overwrite each other in someone's downloads folder.
+os.makedirs(os.path.join(NEST, "appendix"))
+with open(os.path.join(NEST, "appendix", "chapter1.md"), "w") as fh:
+    fh.write("# also one")
+files, _ = agent_worker.collect_attachments(NEST, started)
+check("a colliding name is qualified, never silently dropped",
+      len(files) == 2 and len({n for n, _ in files}) == 2, f"got {[n for n, _ in files]}")
+
+
+# ---- The gap the first live run exposed -------------------------------------
+print("\n--- work done in an EARLIER task's folder ---")
+# The agent is told to work on existing things where they already live. The follow-up that
+# corrected the option book ran as task-0031 but edited the file in task-0030's directory.
+# Scanning only the current task's folder found nothing to attach, on the one task whose whole
+# purpose was to hand back a corrected file. So the scan is rooted at the workspace root.
+ROOT = os.path.join(os.path.dirname(__file__), "ws3", "root")
+shutil.rmtree(ROOT, ignore_errors=True)
+os.makedirs(os.path.join(ROOT, "task-0030-write-an-option-trading-book"))
+os.makedirs(os.path.join(ROOT, "task-0031-two-things-about-the-book"))
+corrected = os.path.join(ROOT, "task-0030-write-an-option-trading-book", "book.txt")
+with open(corrected, "w", encoding="utf-8", newline="") as fh:
+    fh.write("corrected book, chapter 7 now says 2%")
+# The agent rewrites its own memory on nearly every task; those must not ride along.
+for n in ("AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md"):
+    with open(os.path.join(ROOT, n), "w") as fh:
+        fh.write("notes to self")
+# An app from an earlier task is still serving, so a request mid-run touches its database.
+os.makedirs(os.path.join(ROOT, "task-0022-expense-tracker"))
+with open(os.path.join(ROOT, "task-0022-expense-tracker", "expenses.db"), "wb") as fh:
+    fh.write(b"SQLite format 3\0" + b"private")
+with open(os.path.join(ROOT, "task-0022-expense-tracker", "server.log"), "w") as fh:
+    fh.write("GET / 200")
+
+files, note = agent_worker.collect_attachments(ROOT, started)
+names = [n for n, _ in files]
+check("a file corrected in an earlier task's folder IS attached", names == ["book.txt"],
+      f"got {names}")
+check("the agent's own notes are not mailed back",
+      not any(n.startswith("AGENT") for n in names), f"got {names}")
+check("a live app's database is never attached", "expenses.db" not in names, f"got {names}")
+check("nor its logs", "server.log" not in names, f"got {names}")
 
 check("an empty workspace attaches nothing and says nothing",
       agent_worker.collect_attachments(os.path.join(os.path.dirname(__file__), "ws3", "nope-%d" % 1)
