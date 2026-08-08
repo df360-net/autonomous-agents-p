@@ -15,6 +15,7 @@ Run:  python agent_worker.py            # loops forever
 import email
 import email.utils
 import json
+import mimetypes
 import os
 import re
 import smtplib
@@ -149,7 +150,7 @@ def flatten(command, limit=200):
     return line[:limit] + ("..." if len(line) > limit else "") or "(empty)"
 
 
-def build_report(result, workspace, review=None):
+def build_report(result, workspace, review=None, attach_note=""):
     """The reply body. If the reviewer rejected it, that goes ON TOP — you should not have to
     scroll past a confident-sounding answer to find out it failed review. Then the agent's own
     answer, then the evidence: what it actually ran. You read this instead of trusting it."""
@@ -193,6 +194,10 @@ def build_report(result, workspace, review=None):
             f"review: {'PASSED' if review['passed'] else 'NOT PASSED'} "
             f"after {review['rounds']} round(s)"
         )
+    # High up, directly under the run line: the reader must know an artefact came with this
+    # email before they start scrolling through the evidence block looking for one.
+    if attach_note:
+        parts += ["", attach_note]
     # Only append the evidence block when there is evidence. A question answered in one step
     # shouldn't arrive with an empty "FILES WRITTEN" section stapled to it.
     if result["transcript"]:
@@ -264,7 +269,85 @@ def build_review_email(review, task_subject):
     return body[:MAX_REPLY_CHARS]
 
 
-def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, references=None):
+# ---- Attachments -------------------------------------------------------------
+# Whether a document reached the human used to depend entirely on the agent retyping it into
+# the reply. Task 0030 broke both halves of that at once: the agent narrated ("Now I'll compose
+# the email...") instead of pasting, and at 35,554 characters the book could not have survived
+# MAX_REPLY_CHARS even if it had pasted it perfectly. The workspace is the ground truth for what
+# was produced, so the harness ships the artefacts itself and stops depending on the prose.
+ATTACH_MAX_FILES = int(os.environ.get("ATTACH_MAX_FILES", "12"))
+ATTACH_MAX_BYTES = int(os.environ.get("ATTACH_MAX_BYTES", str(2 * 1024 * 1024)))
+ATTACH_MAX_TOTAL = int(os.environ.get("ATTACH_MAX_TOTAL", str(8 * 1024 * 1024)))
+ATTACH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist",
+                    "build", ".next", "target", ".cache", "coverage", ".pytest_cache"}
+
+
+def collect_attachments(workspace, since):
+    """Everything the task produced, ready to hang on the reply.
+
+    Returns (files, note): files is [(filename, bytes)], note is a line for the report — or
+    "" when there is nothing to say. Anything skipped is named in the note, because silently
+    dropping a deliverable is the failure this function exists to prevent.
+
+    The directory is the evidence, not the transcript. The book in task 0030 was appended with
+    six `cat >>` heredocs through run_bash, so a list built from write_file calls would have
+    captured only its first 3,722 characters and looked complete while being a third of a book.
+    """
+    candidates = []
+    for root, dirs, names in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in ATTACH_SKIP_DIRS and not d.startswith(".")]
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue                      # vanished mid-walk; nothing to attach
+            # A whole second of slack: the run's own files are minutes newer than `since`, and
+            # coarse filesystem timestamps should not lose one that was written immediately.
+            if not st.st_size or st.st_mtime < since - 1:
+                continue
+            candidates.append((path, st.st_size, st.st_mtime))
+
+    if not candidates:
+        return [], ""
+
+    # A source tree is not a deliverable. Twelve arbitrary files chosen out of forty would be
+    # noise pretending to be a delivery, and the code ships through GitHub anyway.
+    if len(candidates) > ATTACH_MAX_FILES:
+        return [], (f"NOT ATTACHED: the task produced {len(candidates)} files — too many to "
+                    f"attach. They are in the workspace, and any app was shipped to GitHub.")
+
+    files, skipped, total = [], [], 0
+    for path, size, _ in sorted(candidates, key=lambda c: -c[2]):
+        rel = os.path.relpath(path, workspace).replace(os.sep, "_")
+        if size > ATTACH_MAX_BYTES:
+            skipped.append(f"{rel} ({size // 1024} KB, over the {ATTACH_MAX_BYTES // 1024} KB "
+                           f"per-file limit)")
+            continue
+        if total + size > ATTACH_MAX_TOTAL:
+            skipped.append(f"{rel} (would exceed the {ATTACH_MAX_TOTAL // 1024} KB total)")
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            skipped.append(f"{rel} (unreadable: {e})")
+            continue
+        files.append((rel, data))
+        total += size
+
+    note = ""
+    if files:
+        note = "ATTACHED TO THIS EMAIL\n" + "\n".join(
+            f"  {n}   ({len(d):,} bytes)" for n, d in files)
+    if skipped:
+        note += ("\n" if note else "") + "NOT ATTACHED (still in the workspace)\n" + "\n".join(
+            f"  {s}" for s in skipped)
+    return files, note
+
+
+def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, references=None,
+              attachments=None):
     """Put one message on the wire and return its Message-ID.
 
     Split out from send_reply so a SECOND identity can use it: the reviewer signs off from its
@@ -282,6 +365,10 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
         reply["In-Reply-To"] = in_reply_to
         reply["References"] = " ".join(filter(None, [references, in_reply_to]))
     reply.set_content(body)
+    for name, data in attachments or []:
+        ctype, _ = mimetypes.guess_type(name)
+        maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+        reply.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
 
     if SMTP_SSL:
         smtp = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=60, context=tls_context())
@@ -299,7 +386,7 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     return mid
 
 
-def send_reply(original, body):
+def send_reply(original, body, attachments=None):
     """The worker's answer, threaded under the email that asked for it."""
     subject = decode(original.get("Subject")) or "(no subject)"
     return send_mail(
@@ -310,6 +397,7 @@ def send_reply(original, body):
         from_addr=AGENT_ADDRESS,
         in_reply_to=original.get("Message-ID"),
         references=original.get("References"),
+        attachments=attachments,
     )
 
 
@@ -369,8 +457,10 @@ def handle_message(raw, seq):
     log(f"TASK from {sender}: {subject!r} -> {workspace} (free port {port})")
 
     before = agent_notes.digest()
+    started = time.time()          # anything newer than this in the workspace, the task made
     try:
-        result = agent_brain.agent_loop(task, workspace=workspace, tag="worker")
+        result = agent_brain.agent_loop(task, workspace=workspace, tag="worker",
+                                        require_marker=True)
         result, review = run_review_gate(task, result, workspace)
     except Exception:
         tb = traceback.format_exc()
@@ -389,8 +479,22 @@ def handle_message(raw, seq):
     # the one question this whole mechanism turns on, and it should be answerable from the log.
     log("notes " + agent_notes.describe_digest(before, agent_notes.digest()))
 
+    # Collected after the review gate so a reworked deliverable is the one that ships. Never
+    # let a failure here cost the reply itself — an email with no attachment still carries the
+    # answer, whereas an exception on the way to the wire loses the whole run.
     try:
-        reply_mid = send_reply(msg, build_report(result, workspace, review))
+        attachments, attach_note = collect_attachments(workspace, started)
+        if attachments:
+            log(f"attaching {len(attachments)} file(s): "
+                + ", ".join(n for n, _ in attachments))
+    except Exception:
+        log(f"could not collect attachments:\n{traceback.format_exc()}")
+        attachments, attach_note = [], ("NOT ATTACHED: the harness could not read the "
+                                        "workspace. The files are still there.")
+
+    try:
+        reply_mid = send_reply(msg, build_report(result, workspace, review, attach_note),
+                               attachments)
     except Exception:
         log(f"COULD NOT SEND REPLY:\n{traceback.format_exc()}")
         return

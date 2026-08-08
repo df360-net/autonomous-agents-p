@@ -152,7 +152,15 @@ SYSTEM_PROMPT = (
     "When you MADE something (code, a document, a file), also tell them — briefly — what you "
     "made, what you did to check it, and anything you left untested, stubbed or uncertain. Be "
     "honest: if something failed or you could not verify it, say so plainly rather than hiding "
-    "it. When you simply answered a question, none of that applies — just answer it well."
+    "it. When you simply answered a question, none of that applies — just answer it well.\n"
+    "\n"
+    "FILES YOU LEAVE IN YOUR TASK WORKSPACE ARE ATTACHED to your reply automatically — you do "
+    "not have to paste a long document into the message to deliver it, and the harness attaches "
+    "the file as it is on disk, so finish writing it before you answer. A short piece of writing "
+    "still belongs in the body where it can simply be read. A long one (say, more than a couple "
+    "of pages) is better as the attachment: introduce it, say what is in it, and let the file "
+    "carry the text. Never do both — a reply that pastes the whole document AND attaches it is "
+    "just twice the length."
 )
 
 # ---- Where the email really starts ------------------------------------------
@@ -172,6 +180,31 @@ def strip_preamble(answer):
     if idx == -1:
         return answer
     return answer[idx + len(EMAIL_MARKER):].strip() or answer
+
+
+# Sent back ONCE when a final answer arrives without the marker. Task 0030 ("write an option
+# trading book") ended on a message with no tool calls and no marker whose entire content was
+# "I have the full book content. Now I'll compose the email... Let me compose it." The harness
+# read that as the final answer and mailed it, while the 746-line book it was describing stayed
+# in the workspace where nobody would ever see it.
+#
+# A missing marker is a violation of a contract the agent was given in its own system prompt —
+# a structural fact, not a judgement about the prose — which is why this check is safe to make
+# in the harness. Matching on the narration itself ("Let me compose") was the tempting version
+# and is the wrong one: it is guesswork that breaks the moment the wording changes.
+MISSING_MARKER_NUDGE = (
+    "STOP — that was not an email. It carried no ---EMAIL--- marker, and it reads like you "
+    "talking to yourself about a reply you were about to write.\n"
+    "\n"
+    "Understand what just happened: your turn ENDS the moment you answer without calling a "
+    "tool. Nothing runs after you. There is no later step in which you 'compose' or 'paste' or "
+    "'finalise' anything — whatever you write now is what lands in the recipient's inbox, and "
+    "a file you left in the workspace is not read out on your behalf.\n"
+    "\n"
+    "Write the real message now. Put ---EMAIL--- alone on its own line, then the complete reply "
+    "underneath it. If you were asked to produce a document, its actual text goes in the "
+    "message — do not point at a path, and do not promise to include it."
+)
 
 
 # ---- Tool schema — the full 6-tool menu -------------------------------------
@@ -542,7 +575,8 @@ def call_llm(messages):
 
 
 # ---- The heart: the agent loop ----------------------------------------------
-def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None, tag="agent"):
+def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None, tag="agent",
+               require_marker=False):
     """Run the task to completion. Returns a dict the caller can turn into a report:
 
         {"answer": str, "steps": int, "transcript": [ {tool, args, result}, ... ],
@@ -555,6 +589,10 @@ def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages
     a previous result and `task` becomes a follow-up turn in that same conversation, so the
     agent keeps everything it already knows (used to hand it review feedback). `tag` just
     labels the log lines so two agents in one container are tellable apart.
+
+    `require_marker` is for the worker only: its answers are emailed, so one missing
+    ---EMAIL--- marker buys a single corrective turn. The reviewer must not set it — its final
+    answer is a VERDICT line, and it has no marker to emit.
     """
     if workspace:
         os.makedirs(workspace, exist_ok=True)
@@ -573,6 +611,7 @@ def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages
     else:
         messages = list(messages) + [{"role": "user", "content": task}]
     transcript = []
+    nudged = False        # the marker nudge is spent once and never again
 
     for step in range(1, MAX_STEPS + 1):
         emit(f"{'-' * 20} step {step} {'-' * 20}")
@@ -599,6 +638,16 @@ def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
             answer = msg.get("content") or "(empty)"
+            # Spend the one nudge: the agent owes a marker and did not emit one, which in
+            # practice means it stopped a turn early and narrated instead of writing.
+            if require_marker and not nudged and EMAIL_MARKER not in answer:
+                nudged = True
+                emit(f"No {EMAIL_MARKER} marker in the answer — asking once for the real email.")
+                messages.append({"role": "user", "content": MISSING_MARKER_NUDGE})
+                continue
+            # Fail open past that, exactly as strip_preamble does. If the second attempt is
+            # still unmarked we send it as-is: a leaked preamble is a wart, a withheld reply
+            # is a defect, and the agent has already had its correction.
             emit("FINAL ANSWER:\n" + answer)
             return {"answer": answer, "steps": step, "transcript": transcript,
                     "stopped": "final", "messages": messages}

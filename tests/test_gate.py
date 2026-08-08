@@ -18,7 +18,8 @@ def scenario(name, verdicts, expect_passed, expect_rounds, expect_answer):
     calls.clear()
     seq = list(verdicts)
 
-    def fake_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None, tag="agent"):
+    def fake_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None,
+                  tag="agent", **_):
         if system_prompt is agent_validator.VALIDATOR_PROMPT:
             calls.append(("review", task))
             return make_result(seq.pop(0), [{"tool": "run_bash", "args": {"command": "recheck"},
@@ -90,7 +91,8 @@ seq = ["VERDICT: FAIL\n1. 119 months is not doubled.",
        "VERDICT: PASS\nI recomputed the balance at month 120 myself: $20,096.61."]
 
 
-def fake_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None, tag="agent"):
+def fake_loop(task, workspace=None, on_event=None, system_prompt=None, messages=None,
+              tag="agent", **_):
     if system_prompt is agent_validator.VALIDATOR_PROMPT:
         return make_result(seq.pop(0), [{"tool": "run_bash",
                                          "args": {"command": "python3 -c \"\nprint(20096.61)\n\""},
@@ -129,7 +131,7 @@ if ok:
 sent.clear()
 seq2 = ["VERDICT: FAIL\nno", "VERDICT: FAIL\nno", "VERDICT: FAIL\nstill no"]
 agent_brain.agent_loop = lambda task, workspace=None, on_event=None, system_prompt=None, \
-    messages=None, tag="agent": (
+    messages=None, tag="agent", **_: (
         make_result(seq2.pop(0), []) if system_prompt is agent_validator.VALIDATOR_PROMPT
         else make_result("attempted answer"))
 agent_worker.handle_message(RAW.replace(b"<orig@", b"<orig2@"), seq=10)
