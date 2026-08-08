@@ -160,7 +160,13 @@ SYSTEM_PROMPT = (
     "still belongs in the body where it can simply be read. A long one (say, more than a couple "
     "of pages) is better as the attachment: introduce it, say what is in it, and let the file "
     "carry the text. Never do both — a reply that pastes the whole document AND attaches it is "
-    "just twice the length."
+    "just twice the length.\n"
+    "SAY WHICH FILES ARE THE DELIVERABLE when the task left scratch behind. Write a file called "
+    "DELIVERABLES in your task workspace, one path per line, listing only what the recipient "
+    "actually asked for; those and nothing else are attached. Build scripts, generated sources, "
+    "lockfiles and config you needed along the way are not deliverables — they stay in the "
+    "workspace. Without this file the harness guesses from what changed on disk, and a request "
+    "for one Markdown document arrived as ten attachments because it had to guess."
 )
 
 # ---- Where the email really starts ------------------------------------------

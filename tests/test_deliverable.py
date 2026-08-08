@@ -191,6 +191,72 @@ check("an empty workspace attaches nothing and says nothing",
                                        if False else NEST + "-missing", started) == ([], ""))
 
 
+# ---- 2b. Scaffolding, and the agent naming its own deliverable --------------
+print("\n--- one deliverable, not the whole working directory ---")
+
+# Exactly what task 0032 produced: one Markdown book asked for, nine build artefacts beside it.
+MD = os.path.join(os.path.dirname(__file__), "ws3", "task-0032")
+shutil.rmtree(MD, ignore_errors=True)
+os.makedirs(MD)
+produced = ["option-trading-book.md", "build.py", "diagrams.py", "payoff_diagrams.py",
+            "curve_plots.py", "strategy_flow.mmd", "beginner_path.mmd", "package.json",
+            "package-lock.json", "puppeteer-config.json"]
+for n in produced:
+    with open(os.path.join(MD, n), "w") as fh:
+        fh.write("content of " + n)
+
+files, note = agent_worker.collect_attachments(MD, started, MD)
+names = [n for n, _ in files]
+check("lockfiles and tool config are never a deliverable",
+      not ({"package.json", "package-lock.json", "puppeteer-config.json"} & set(names)),
+      f"got {names}")
+
+# ...and with the agent saying what it meant, the noise goes entirely.
+with open(os.path.join(MD, "DELIVERABLES"), "w") as fh:
+    fh.write("# the thing that was asked for\noption-trading-book.md\n\n")
+files, note = agent_worker.collect_attachments(MD, started, MD)
+check("a nomination reduces it to the one file asked for",
+      [n for n, _ in files] == ["option-trading-book.md"], f"got {[n for n, _ in files]}")
+check("the DELIVERABLES file does not attach itself", "DELIVERABLES" not in dict(files))
+
+# A nomination is a decision, not a hint: it outranks the skip heuristics.
+with open(os.path.join(MD, "DELIVERABLES"), "w") as fh:
+    fh.write("package.json\n")
+files, _ = agent_worker.collect_attachments(MD, started, MD)
+check("an explicitly named file beats the skip list",
+      [n for n, _ in files] == ["package.json"], f"got {[n for n, _ in files]}")
+
+# Nominating something that isn't there must be visible, not silent.
+with open(os.path.join(MD, "DELIVERABLES"), "w") as fh:
+    fh.write("option-trading-book.md\nthe-one-i-forgot-to-write.md\n")
+files, note = agent_worker.collect_attachments(MD, started, MD)
+check("a missing nomination is reported, not swallowed",
+      [n for n, _ in files] == ["option-trading-book.md"] and "the-one-i-forgot" in note, note)
+
+# Attaching to outbound email is the one thing here that leaves the container.
+with open(os.path.join(MD, "DELIVERABLES"), "w") as fh:
+    fh.write("../../../../../../etc/passwd\noption-trading-book.md\n")
+files, note = agent_worker.collect_attachments(MD, started, MD)
+check("a path escaping the workspace is refused",
+      [n for n, _ in files] == ["option-trading-book.md"] and "refused" in note, note)
+
+# The whole point of the nomination: 40 files is normally an outright refusal to attach.
+MANY = os.path.join(os.path.dirname(__file__), "ws3", "task-many")
+shutil.rmtree(MANY, ignore_errors=True)
+os.makedirs(MANY)
+for i in range(40):
+    with open(os.path.join(MANY, f"f{i}.txt"), "w") as fh:
+        fh.write("x")
+files, note = agent_worker.collect_attachments(MANY, started, MANY)
+check("40 files with no nomination still attaches nothing", files == [])
+check("  ...and the refusal now points at the way out", "DELIVERABLES" in note, note)
+with open(os.path.join(MANY, "DELIVERABLES"), "w") as fh:
+    fh.write("f7.txt\n")
+files, _ = agent_worker.collect_attachments(MANY, started, MANY)
+check("a nomination rescues the delivery from a crowded workspace",
+      [n for n, _ in files] == ["f7.txt"], f"got {[n for n, _ in files]}")
+
+
 # ---- 3. End to end: does it survive the wire? -------------------------------
 print("\n--- on the wire ---")
 captured = {}

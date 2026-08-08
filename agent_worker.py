@@ -288,9 +288,60 @@ ATTACH_SKIP_NAMES = {"AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md", ".processe
 # sqlite file must never be posted to anyone because the timestamp made it look fresh.
 ATTACH_SKIP_EXTS = {".log", ".pid", ".lock", ".sock", ".pyc", ".db", ".db-journal", ".db-wal",
                     ".db-shm", ".sqlite", ".sqlite3"}
+# Build scaffolding. Asked for one self-contained Markdown file, the harness sent ten: the book
+# plus package.json, package-lock.json, puppeteer-config.json and the scripts that generated it.
+# None of these is ever the thing someone asked for, and one more of them would have crossed
+# ATTACH_MAX_FILES and attached NOTHING — the loud failure hiding behind the untidy one.
+ATTACH_SKIP_SCAFFOLD = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+                        "pnpm-lock.yaml", "poetry.lock", "Pipfile.lock", "tsconfig.json",
+                        ".gitignore", ".dockerignore", ".npmrc", ".editorconfig"}
+
+# How the agent says "this one, not the fifteen scratch files next to it". Writing this file is
+# optional and its absence is not an error: no nomination means the heuristics above decide, so
+# an agent that never learns about it still delivers.
+DELIVERABLES_FILE = "DELIVERABLES"
 
 
-def collect_attachments(root, since):
+def _is_scaffold(name):
+    low = name.lower()
+    return (name in ATTACH_SKIP_SCAFFOLD or low.endswith("-config.json")
+            or low.endswith(".config.json") or low.endswith(".config.js")
+            or low.endswith(".config.mjs"))
+
+
+def _read_nomination(path, root):
+    """Parse a DELIVERABLES file into (paths, problems).
+
+    One path per line, blank lines and # comments ignored. Relative paths resolve against the
+    file's own directory, which is what an agent writing `option-trading-book.md` means. A path
+    that escapes the workspace root is refused outright — attaching a file to an outgoing email
+    is the one thing in this container that reaches beyond it, so /etc/shadow must not be
+    nameable however it got into the list.
+    """
+    paths, problems = [], []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as e:
+        return [], [f"could not read {DELIVERABLES_FILE}: {e}"]
+
+    base, real_root = os.path.dirname(path), os.path.realpath(root)
+    for line in lines:
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        full = entry if os.path.isabs(entry) else os.path.join(base, entry)
+        full = os.path.realpath(full)
+        if os.path.commonpath([full, real_root]) != real_root:
+            problems.append(f"{entry} (outside the workspace — refused)")
+        elif not os.path.isfile(full):
+            problems.append(f"{entry} (named in {DELIVERABLES_FILE} but not on disk)")
+        elif full not in paths:
+            paths.append(full)
+    return paths, problems
+
+
+def collect_attachments(root, since, task_workspace=None):
     """Everything the task produced, ready to hang on the reply.
 
     Returns (files, note): files is [(filename, bytes)], note is a line for the report — or
@@ -307,12 +358,10 @@ def collect_attachments(root, since):
     folder this function would have found nothing and attached nothing, on the very task whose
     entire purpose was to hand back a corrected file.
     """
-    candidates = []
+    candidates, nominations = [], []
     for parent, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in ATTACH_SKIP_DIRS and not d.startswith(".")]
         for name in names:
-            if name in ATTACH_SKIP_NAMES or os.path.splitext(name)[1].lower() in ATTACH_SKIP_EXTS:
-                continue
             path = os.path.join(parent, name)
             try:
                 st = os.stat(path)
@@ -320,21 +369,50 @@ def collect_attachments(root, since):
                 continue                      # vanished mid-walk; nothing to attach
             # A whole second of slack: the run's own files are minutes newer than `since`, and
             # coarse filesystem timestamps should not lose one that was written immediately.
-            if not st.st_size or st.st_mtime < since - 1:
+            fresh = st.st_mtime >= since - 1
+            if name == DELIVERABLES_FILE and fresh:
+                nominations.append(path)
+                continue
+            if (name in ATTACH_SKIP_NAMES or _is_scaffold(name)
+                    or os.path.splitext(name)[1].lower() in ATTACH_SKIP_EXTS):
+                continue
+            if not st.st_size or not fresh:
                 continue
             candidates.append((path, st.st_size, st.st_mtime))
 
-    if not candidates:
+    # An explicit nomination outranks every heuristic above: the agent knows which file it was
+    # asked for, and the harness is only guessing. A nominated file is attached even if the
+    # skip lists would have dropped it — someone may genuinely have asked for a package.json.
+    problems = []
+    if task_workspace:
+        nominations.sort(key=lambda p: os.path.dirname(p) != os.path.normpath(task_workspace))
+    if nominations:
+        chosen, problems = _read_nomination(nominations[0], root)
+        picked = []
+        for path in chosen:
+            try:
+                picked.append((path, os.path.getsize(path), 0))
+            except OSError as e:
+                problems.append(f"{os.path.basename(path)} (unreadable: {e})")
+        candidates = picked
+    elif len(candidates) > ATTACH_MAX_FILES:
+        # A source tree is not a deliverable. Twelve arbitrary files chosen out of forty would
+        # be noise pretending to be a delivery, and the code ships through GitHub anyway.
+        return [], (f"NOT ATTACHED: the task produced {len(candidates)} files — too many to "
+                    f"attach, and it left no {DELIVERABLES_FILE} file saying which ones matter. "
+                    f"They are in the workspace, and any app was shipped to GitHub.")
+
+    if not candidates and not problems:
         return [], ""
 
-    # A source tree is not a deliverable. Twelve arbitrary files chosen out of forty would be
-    # noise pretending to be a delivery, and the code ships through GitHub anyway.
-    if len(candidates) > ATTACH_MAX_FILES:
-        return [], (f"NOT ATTACHED: the task produced {len(candidates)} files — too many to "
-                    f"attach. They are in the workspace, and any app was shipped to GitHub.")
-
-    files, skipped, total, used = [], [], 0, set()
-    for path, size, _ in sorted(candidates, key=lambda c: -c[2]):
+    files, skipped, total, used = [], problems, 0, set()
+    # Nominated order is the agent's own; otherwise newest first.
+    order = candidates if nominations else sorted(candidates, key=lambda c: -c[2])
+    if len(order) > ATTACH_MAX_FILES:      # only reachable via a long nomination list
+        skipped.append(f"{len(order) - ATTACH_MAX_FILES} further nominated file(s), over the "
+                       f"{ATTACH_MAX_FILES}-attachment limit")
+        order = order[:ATTACH_MAX_FILES]
+    for path, size, _ in order:
         # The plain filename, because that is what the recipient wants to save. Only when two
         # files would land on the same name does it grow a qualifier — scanning the whole
         # workspace root means index.html from two different tasks can genuinely collide, and
@@ -512,7 +590,7 @@ def handle_message(raw, seq):
     try:
         # WORKSPACE_ROOT, not `workspace`: work on an existing thing happens in the folder that
         # thing already lives in, which is a different task's folder than this one.
-        attachments, attach_note = collect_attachments(WORKSPACE_ROOT, started)
+        attachments, attach_note = collect_attachments(WORKSPACE_ROOT, started, workspace)
         if attachments:
             log(f"attaching {len(attachments)} file(s): "
                 + ", ".join(n for n, _ in attachments))
