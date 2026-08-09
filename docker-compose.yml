@@ -69,8 +69,8 @@ x-agent-env: &agent-env
   # ceilings above are the real bound. Narrow it to "@agents.local,you@example.com" the
   # moment this box is reachable by anyone you would not hand the API key to.
   ALLOWED_SENDERS: "${ALLOWED_SENDERS:-*}"
-  AGENT_MAX_HOPS: "${AGENT_MAX_HOPS:-3}"
-  AGENT_MAX_THREAD_DEPTH: "${AGENT_MAX_THREAD_DEPTH:-20}"
+  AGENT_MAX_HOPS: "${AGENT_MAX_HOPS:-100}"
+  AGENT_MAX_THREAD_DEPTH: "${AGENT_MAX_THREAD_DEPTH:-20}"   # humans only; see agent_principal
   # The key that makes agent-to-agent messages believable. UNSET TODAY, deliberately: with
   # no key, every message claiming to come from an agent is refused, which is the correct
   # posture for a fleet with no peer traffic yet. Set it (same value on both agents) when
@@ -87,7 +87,7 @@ x-agent-env: &agent-env
   BOSS_ADDRESS: "${BOSS_ADDRESS:-boss@agents.local}"
   # Hops bound how DEEP a chain of agent messages can go; this bounds how WIDE one task can
   # fan out. Five is generous for "ask a peer to review this" and far short of a loop.
-  AGENT_MAX_PEER_SENDS: "${AGENT_MAX_PEER_SENDS:-5}"
+  AGENT_MAX_PEER_SENDS: "${AGENT_MAX_PEER_SENDS:-25}"
   # MEMORY (agent_memory.py, D5). The agent's notes are a git repo outside the container,
   # which is what makes the container disposable:
   #   docker compose rm -f -v agent1 && docker compose up -d agent1

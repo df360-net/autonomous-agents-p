@@ -259,9 +259,15 @@ def admit(envelope):
         return Decision(False, principal, clean,
                         f"hop limit reached ({clean.hops} >= {MAX_HOPS})")
 
-    # 6. THREAD DEPTH. Applies to everyone: this is the guard for loops that carry no counter.
+    # 6. THREAD DEPTH — for traffic that carries NO hop counter, which is the only traffic it
+    #    can help with. A forwarding rule, a mailing list or an out-of-office responder produces
+    #    a loop with no counter in it, and References growing on every pass is the only signal
+    #    available. An ATTESTED agent message already carries a hop count that is incremented by
+    #    the harness and covered by the signature, so this guard would only duplicate it — and
+    #    worse, duplicate it at a DIFFERENT number, silently capping long agent conversations at
+    #    whatever this happens to be set to rather than at the hop limit that was chosen for it.
     depth = len(clean.references.split())
-    if depth >= MAX_THREAD_DEPTH:
+    if principal.kind != "agent" and depth >= MAX_THREAD_DEPTH:
         return Decision(False, principal, clean,
                         f"thread is {depth} messages deep (>= {MAX_THREAD_DEPTH}) — a loop")
 

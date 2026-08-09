@@ -188,9 +188,15 @@ check("  ...and one hop below it is fine",
 
 deep = " ".join(f"<r{i}@x>" for i in range(agent_principal.MAX_THREAD_DEPTH))
 d = agent_principal.admit(env(references=deep))
-check("REFUSED: a thread this deep is a mail loop, whoever is in it", not d.allowed, d.reason)
+check("REFUSED: a thread this deep is a mail loop", not d.allowed, d.reason)
 check("  ...and this guard needs no hop counter, which is the point",
       "loop" in d.reason and d.envelope.hops == 0)
+# It applies ONLY to traffic with no hop count. An attested agent already carries one, and
+# duplicating it here would silently cap long agent conversations at this number instead of
+# at the hop limit chosen for them.
+d = agent_principal.admit(replace(from_peer(), references=deep))
+check("  ...but an ATTESTED agent is exempt — its hop count already bounds the chain",
+      d.allowed, d.reason)
 check("a normal back-and-forth is untouched",
       agent_principal.admit(env(references="<a@x> <b@x> <c@x>")).allowed)
 
