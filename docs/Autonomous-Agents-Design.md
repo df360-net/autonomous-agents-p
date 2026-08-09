@@ -624,6 +624,13 @@ arbitrage the whole thesis rests on.
 
 ## 14. Roadmap
 
+> **Superseded for everything past "finishing §9" — see [Fleet-Design.md](Fleet-Design.md).**
+> The items below under *Then* were written for a personal fleet on one laptop. The goal is now a
+> platform other teams can run, and three of those items change shape: "N agents" needs an identity
+> and tenancy model first, "Compose → Kind pods" is deferred behind making the agent stateless
+> (and then wants a Deployment, not a StatefulSet), and per-agent routing must not be decided by
+> an LLM. Fleet-Design.md also corrects §7, §8 and the app-slot mechanism in §9.
+
 **Finishing §9 — the next work, in order:**
 
 1. **ci-watcher pod** — poll the Actions API for completed runs across `agent-*` repos, emit

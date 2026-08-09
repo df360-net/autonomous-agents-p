@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 tests/ws*/
 tests/out*/
+
+# Deliverables pulled out of an agent's container to read. They belong to the task that
+# produced them, not to this repo — the canonical copies live in OneDrive.
+option-trading-book*.txt
+option-trading-book*.md
