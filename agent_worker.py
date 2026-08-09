@@ -28,6 +28,7 @@ from email.message import EmailMessage
 from imaplib import IMAP4, IMAP4_SSL
 
 import agent_brain
+import agent_budget
 import agent_delivery
 import agent_notes
 import agent_validator
@@ -188,6 +189,9 @@ def build_report(result, workspace, review=None, attach_note=""):
         (f"run: {verdict} in {result['steps']} steps, {len(result['transcript'])} tool calls"
          if result.get("steps") is not None
          else f"run: {verdict} — step count unknown (crashed outside the step loop)"),
+        # On the same footer as the steps and the review verdict, because the price of a task
+        # is evidence about the task, and evidence belongs where the reader already looks.
+        agent_budget.task_summary(),
     ]
     if review:
         parts.append(
@@ -282,7 +286,11 @@ ATTACH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env
                     "build", ".next", "target", ".cache", "coverage", ".pytest_cache"}
 # The agent's own memory, which it rewrites on almost every task, and the harness's state.
 # Mailing these back would attach three files nobody asked for to every single reply.
-ATTACH_SKIP_NAMES = {"AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md", ".processed.json"}
+ATTACH_SKIP_NAMES = {"AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md", ".processed.json",
+                     # Harness state that lives in the scan root and is written on every run.
+                     # The ledger gets a line per LLM call, so without this every single reply
+                     # would arrive with the agent's spend history stapled to it.
+                     ".spend.jsonl", "FLEET-PAUSED"}
 # Live application data, not deliverables. Apps built by earlier tasks keep serving inside this
 # container, so a request arriving mid-run touches their database — and an expense tracker's
 # sqlite file must never be posted to anyone because the timestamp made it look fresh.
@@ -561,6 +569,10 @@ def handle_message(raw, seq):
     )
     log(f"TASK from {sender}: {subject!r} -> {workspace} (free port {port})")
 
+    # Scopes every LLM call from here on to this task and this requester, so the ledger can
+    # answer "what did that email cost?" rather than only "what did today cost?".
+    agent_budget.start_task(os.path.basename(workspace), requester=sender)
+
     before = agent_notes.digest()
     started = time.time()          # anything newer than this in the workspace, the task made
     try:
@@ -684,6 +696,12 @@ def drain_inbox(processed):
     Dovecot will close an idle IMAP connection out from under us long before a slow one
     finishes. Grab the mail, flag it, hang up — then build.
     """
+    # The kill switch is checked here, before the connection, precisely so that a paused fleet
+    # consumes nothing: no fetch, no \Seen, no dedupe entry. The backlog is untouched and
+    # arrives in order once a human removes the file.
+    if agent_budget.paused():
+        log(f"PAUSED: {agent_budget.PAUSE_FILE} exists — not fetching mail. Remove it to resume.")
+        return []
     if IMAP_SSL:
         imap = IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=tls_context())
     else:

@@ -27,7 +27,7 @@ def replies(*answers):
     seq = list(answers)
     seen = []
 
-    def fake(messages):
+    def fake(messages, role="worker", **_):
         seen.append(list(messages))
         return {"role": "assistant", "content": seq.pop(0)}
     return fake, seen
@@ -177,10 +177,18 @@ with open(os.path.join(ROOT, "task-0022-expense-tracker", "expenses.db"), "wb") 
 with open(os.path.join(ROOT, "task-0022-expense-tracker", "server.log"), "w") as fh:
     fh.write("GET / 200")
 
+# Harness state written on every run, sitting in the same directory the walk starts from.
+for n in (".spend.jsonl", "FLEET-PAUSED", ".processed.json"):
+    with open(os.path.join(ROOT, n), "w") as fh:
+        fh.write("harness state")
+
 files, note = agent_worker.collect_attachments(ROOT, started)
 names = [n for n, _ in files]
 check("a file corrected in an earlier task's folder IS attached", names == ["book.txt"],
       f"got {names}")
+check("the spend ledger is never mailed to anyone", ".spend.jsonl" not in names, f"got {names}")
+check("nor the pause file or the dedupe state",
+      not ({"FLEET-PAUSED", ".processed.json"} & set(names)), f"got {names}")
 check("the agent's own notes are not mailed back",
       not any(n.startswith("AGENT") for n in names), f"got {names}")
 check("a live app's database is never attached", "expenses.db" not in names, f"got {names}")

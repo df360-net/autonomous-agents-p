@@ -28,6 +28,8 @@ import urllib.parse
 import urllib.request
 from html import unescape
 
+import agent_budget
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -526,7 +528,7 @@ RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 LLM_ATTEMPTS = int(os.environ.get("LLM_ATTEMPTS", "4"))
 
 
-def call_llm(messages):
+def call_llm(messages, role="worker"):
     """One completion, retried through transient failures.
 
     WHY THE RETRY EXISTS. The first version caught HTTPError and URLError only — the errors
@@ -543,6 +545,12 @@ def call_llm(messages):
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise LLMError("DEEPSEEK_API_KEY is not set in the environment.")
+    # Fail closed on money, before anything is sent. Re-raised as LLMError so the failure path
+    # that already exists — honest answer, gate skipped, human emailed — runs unchanged.
+    try:
+        agent_budget.check()
+    except agent_budget.BudgetExceeded as e:
+        raise LLMError(f"Stopped on budget: {e}") from None
     payload = json.dumps({"model": MODEL, "messages": messages, "tools": TOOLS_SCHEMA}).encode("utf-8")
     last = "no attempt made"
 
@@ -557,7 +565,12 @@ def call_llm(messages):
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 body = resp.read()
-            return json.loads(body)["choices"][0]["message"]
+            parsed = json.loads(body)
+            message = parsed["choices"][0]["message"]
+            # Recorded only after the message parses, so a malformed body that gets retried is
+            # not also billed twice. `usage` was previously read and thrown away.
+            agent_budget.record(parsed.get("usage"), model=MODEL, role=role)
+            return message
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:500]
             if e.code not in RETRY_STATUSES:
@@ -622,7 +635,9 @@ def agent_loop(task, workspace=None, on_event=None, system_prompt=None, messages
     for step in range(1, MAX_STEPS + 1):
         emit(f"{'-' * 20} step {step} {'-' * 20}")
         try:
-            msg = call_llm(messages)
+            # `tag` is already "worker" or "reviewer" — carrying it into the ledger is what
+            # makes "what does the review gate actually cost?" an arithmetic question.
+            msg = call_llm(messages, role=tag)
         except LLMError as e:
             emit(f"LLM ERROR: {e}")
             return {"answer": f"Run aborted at step {step}: {e}", "steps": step,
