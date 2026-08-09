@@ -319,6 +319,16 @@ def sync(workspace_root=None, scopes=None):
     if workspace_root and scopes and _is_clone(TENANT_DIR) and not _has_commits(TENANT_DIR):
         if _seed(workspace_root, scopes):
             lines.append("memory: seeded from the existing workspace notes (one time)")
+            # PUSH IT NOW, not at the end of the first task. Deferring left the agent in a state
+            # that looked migrated and was not durable at all: the files were in the clone's
+            # working tree, the bare repo was empty, and the only real copy was still the
+            # workspace volume. That window lasts until the next task completes — days, maybe —
+            # and it is precisely when someone runs the cattle test believing the move is done.
+            lines.append(publish("seed-from-workspace"))
+    elif enabled() and _is_clone(TENANT_DIR) and _unpushed(TENANT_DIR):
+        # A commit stranded by an earlier offline push goes out at boot rather than waiting for
+        # the agent to happen to write another note.
+        lines.append(publish("flush-pending"))
     _state["synced"] = True
     return lines
 

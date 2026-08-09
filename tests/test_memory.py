@@ -108,8 +108,6 @@ mem, notes = agent("agent1", TENANT, FLEET)
 mem.sync(ws1, notes.SCOPES)
 check("the existing notes were imported, not lost",
       read(notes.path_of("AGENT.md")) == "python is python3 here\n")
-check("THE WORKSPACE COPY IS UNTOUCHED until the data is demonstrably on the remote",
-      read(os.path.join(ws1, "AGENT.md")) == "python is python3 here\n")
 check("tenant-scope files land at the repo root",
       notes.path_of("AGENT-AVOID.md") == os.path.join(mem.TENANT_DIR, "AGENT-AVOID.md"))
 check("PERSONAL scope is namespaced by agent — two agents cannot collide",
@@ -119,6 +117,14 @@ check("PERSONAL scope is namespaced by agent — two agents cannot collide",
 check("a union merge driver is configured, so two agents appending do not conflict",
       "merge=union" in (read(os.path.join(mem.TENANT_DIR, ".gitattributes")) or ""))
 
+# Durable BEFORE any task runs. Deferring this to the end of the first task left the agent
+# looking migrated while the bare repo was still empty and the only copy was the volume the
+# whole exercise is about not depending on.
+check("SEEDING PUSHES IMMEDIATELY — not at the end of the first task",
+      git(["log", "--oneline"], cwd=TENANT).stdout.strip() != "",
+      "the bare repo is still empty")
+check("  ...and the forwarding stub is already in place",
+      "MOVED" in (read(os.path.join(ws1, "AGENT.md")) or ""))
 print(mem.publish("task-0001-first"))
 check("the seeded state is pushed", git(["log", "--oneline"], cwd=TENANT).stdout.strip() != "")
 check("committed as the agent, so git log is the audit trail",
@@ -133,6 +139,29 @@ check("  ...which names where the file actually went now",
       notes.path_of("AGENT.md") in stub, repr(stub))
 check("  ...and the real memory is untouched by that",
       read(notes.path_of("AGENT.md")) == "python is python3 here\n")
+
+
+# A crash between "copy the notes out" and "push them" must not destroy the only copy. Staged
+# so seeding happens while the remote is already down: clone first against an empty workspace
+# so there is nothing to seed, THEN give the agent notes, then kill the remote.
+print("\n--- the old copies survive a seed whose push fails ---")
+ORD = bare("ordering.git")
+ows = os.path.join(ROOT, "ord", "workspace")
+memo, noteso = agent("agent1", ORD, home=os.path.join(ROOT, "ord"))
+memo.sync(ows, noteso.SCOPES)                        # clones; nothing to seed yet
+write(os.path.join(ows, "AGENT.md"), "the only copy of this\n")
+os.rename(ORD, ORD + ".gone")                        # the remote is gone before the seed
+lines = memo.sync(ows, noteso.SCOPES)
+check("it still seeds while offline", any("seeded" in l for l in lines), str(lines))
+check("  ...and says the push did not land", any("PUSH FAILED" in l for l in lines), str(lines))
+check("THE OLD PATH IS NOT RETIRED WHILE THE PUSH IS FAILING",
+      read(os.path.join(ows, "AGENT.md")) == "the only copy of this\n",
+      repr(read(os.path.join(ows, "AGENT.md"))))
+os.rename(ORD + ".gone", ORD)
+check("  ...the stranded commit goes out at the next start",
+      "pushed" in memo.publish("later"))
+check("  ...and only once it lands does the signpost go up",
+      "MOVED" in (read(os.path.join(ows, "AGENT.md")) or ""))
 
 
 # ---- THE CATTLE TEST ---------------------------------------------------------
