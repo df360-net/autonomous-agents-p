@@ -3,6 +3,11 @@
 > **Read this first, fully, before doing anything in this project.** It is the single source of
 > truth for what we're building, the decisions already locked, the runtime environment, how the
 > user works, and exactly where we are. Written 2026-08-01.
+>
+> **Currency warning (2026-08-09).** §§1-6 and 9 still hold. §7 is rewritten below. §§8, 10 and
+> 11 describe subsystems that have since been rebuilt — each now carries a note saying what
+> changed. The current plan and its status live in
+> [docs/Fleet-Design.md](docs/Fleet-Design.md); when that and this disagree, that one wins.
 
 ---
 
@@ -153,7 +158,38 @@ result + what it built + how it tested it.
 
 ## 7. Where we are RIGHT NOW / next steps
 
-Phase 0 steps 1–5 are **DONE and deployed** (2026-08-01). The stack runs on Zeenie at
+**Updated 2026-08-09. TWO AGENTS, `dev/agent1` and `dev/agent2`, running on Zeenie.** Phase 0
+is ancient history; phases 1 and 2 of [docs/Fleet-Design.md](docs/Fleet-Design.md) are
+essentially done:
+
+| what | where | state |
+|---|---|---|
+| identity derived from TENANT + AGENT_NAME | `fleet_identity.py` | D1 done |
+| a task is an envelope, mail is one transport | `agent_envelope/inbox/outbox.py` | D3 done |
+| who is asking, resolved before any handler runs | `agent_principal.py` | D6 done |
+| spend ledger + configurable ceilings + kill switch | `agent_budget.py` | D7 done |
+| memory is a git repo OUTSIDE the container | `agent_memory.py` | D5 done |
+| a second agent | `docker-compose.yml` + `provision-agent.ps1` | done |
+
+**The cattle test passed on real hardware.** agent1's container *and* its 821MB workspace
+volume were destroyed and recreated; all 53,029 bytes of memory came back byte-identical from
+the git remote. That is the property everything else rests on: the container is disposable,
+the memory is not.
+
+**Adding an agent is six lines of compose plus `provision-agent.ps1 <name>`.** It comes up
+already knowing what the others learned — tenant memory is shared, `AGENT-ASSETS.md` is not.
+
+Still open in phase 2: the preview router (no agent should publish a host port) and addressing
+apps as `<tenant>/<app>` instead of a slot integer. Both touch live deployments, so both wait
+on a decision from Jianmin rather than on code.
+
+**Ceilings are $20/task, $150/day, $500/fleet**, set high deliberately. Measured: a trivial
+question ~$0.01, a real 130-step build that shipped an app ~$0.50.
+
+<details>
+<summary>Historical — Phase 0, 2026-08-01</summary>
+
+Phase 0 steps 1–5 were **DONE and deployed** (2026-08-01). The stack runs on Zeenie at
 `C:\Users\jianm\autonomous-agents`; step 6 (end-to-end build task) was exercised the same day.
 
 | # | step | state |
@@ -179,8 +215,11 @@ things worth knowing:
 - The model asked for a nonexistent `edit_file` tool at step 11, got `ERROR: no such tool`
   back as text, and immediately self-healed with `sed`. Errors-as-text earns its keep.
 
-Roundcube: `http://192.168.0.21:8080`, log in as `boss@agents.local`. `scripts/task_agent.py`
-does the same thing from a terminal. Mailbox passwords are in `.env` on Zeenie (gitignored).
+</details>
+
+Roundcube: `http://192.168.0.21:8080`, log in as `boss@agents.local`. Mailbox passwords live in
+`.env` on Zeenie (gitignored) and are written there by `provision-agent.ps1` — do not
+hand-write them, or the mailbox and the file drift apart.
 
 **Three deployment gotchas that cost real time — do not rediscover them:**
 - **`docker pull`/`build` over SSH ALWAYS fails on Zeenie** with `error getting credentials —
@@ -307,6 +346,12 @@ correct.
 
 ## 10. The agent's own memory (added 2026-08-02, Jianmin's idea)
 
+> **Superseded in part (2026-08-09, D5).** The three files, and the "the agent owns them, the
+> harness never writes them" rule, are all still exactly right. What changed is WHERE they
+> live: a git repo outside the container, not `/workspace`. `AGENT.md` and `AGENT-AVOID.md` are
+> now shared by every agent in the tenant; `AGENT-ASSETS.md` is private to each; and a fourth
+> file, `FLEET.md`, is operator-only — no agent can write it. See `agent_memory.py`.
+
 **His framing:** "We don't have to re-invent the wheel. We can do similar things like Claude
 code… tell the agent this is your environment, you own and maintain this environment. Ask the
 agent to create two files: `agent.md` — every prompt he needs to read this doc; `agent-assets.md`
@@ -354,6 +399,11 @@ current task touched.
 ---
 
 ## 11. Delivery to Kubernetes (added 2026-08-02, Jianmin's idea) — HALF BUILT
+
+> **Still accurate, with one addition (2026-08-09).** `agent-<app>` is a FLEET-WIDE name, so two
+> agents asked to build "a todo list" resolve to the same repository. `ship_app` now records the
+> owning agent and refuses a push from anyone else. The proper fix — addressing apps as
+> `<tenant>/<app>` — is D4 and is not built.
 
 **His framing:** "Going forward, any applications need to be checked into GitHub, the GitHub CI
 auto kicks off, the Harness agent does the CD. Let the agent understand we have Kubernetes pods.
