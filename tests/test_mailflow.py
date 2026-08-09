@@ -13,6 +13,7 @@ os.environ.update({
 })
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_brain
+import agent_inbox
 import agent_worker
 
 captured = []
@@ -80,7 +81,7 @@ RAW = (
 
 t = threading.Thread(target=fake_smtp, daemon=True)
 t.start()
-agent_worker.handle_message(RAW, seq=7)
+agent_worker.run(agent_inbox.envelope_from_bytes(RAW, seq=7))
 t.join(timeout=10)
 
 assert captured, "no mail was sent"
@@ -102,7 +103,8 @@ assert "task-0007-build-a-tic-tac-toe-web-app" in body, "workspace name wrong"
 
 # Loop guard: mail from the agent itself must be ignored (no reply sent).
 before = len(captured)
-agent_worker.handle_message(RAW.replace(b"Boss <boss@agents.local>", b"agent1@agents.local"), seq=8)
+agent_worker.run(agent_inbox.envelope_from_bytes(
+    RAW.replace(b"Boss <boss@agents.local>", b"agent1@agents.local"), seq=8))
 assert len(captured) == before, "worker replied to itself — mail loop!"
 
 print("\nALL ASSERTIONS PASSED")

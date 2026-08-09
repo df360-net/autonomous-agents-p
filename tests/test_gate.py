@@ -3,7 +3,7 @@ import os, sys
 os.environ.update({"WORKSPACE_ROOT": os.path.join(os.path.dirname(__file__), "ws2"),
                    "VALIDATION_ROUNDS": "3"})
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import agent_brain, agent_validator, agent_worker
+import agent_brain, agent_inbox, agent_outbox, agent_validator, agent_worker
 
 calls = []
 
@@ -85,7 +85,8 @@ all_ok &= p is False
 # ---- the reviewer's own email ------------------------------------------------
 agent_worker.VALIDATION_ROUNDS = 3
 sent = []
-agent_worker.send_mail = lambda **kw: (sent.append(kw), "<mid-%d@x>" % len(sent))[1]
+# The transport is agent_outbox now; deliver()/deliver_review() both go through send_mail.
+agent_outbox.send_mail = lambda **kw: (sent.append(kw), "<mid-%d@x>" % len(sent))[1]
 
 seq = ["VERDICT: FAIL\n1. 119 months is not doubled.",
        "VERDICT: PASS\nI recomputed the balance at month 120 myself: $20,096.61."]
@@ -104,7 +105,7 @@ agent_brain.agent_loop = fake_loop
 RAW = (b"From: Boss <boss@agents.local>\r\nTo: agent1@agents.local\r\n"
        b"Subject: Two calculations\r\nMessage-ID: <orig@agents.local>\r\n"
        b"Content-Type: text/plain\r\n\r\nhow long to double?\r\n")
-agent_worker.handle_message(RAW, seq=9)
+agent_worker.run(agent_inbox.envelope_from_bytes(RAW, seq=9))
 
 print()
 ok = len(sent) == 2
@@ -134,7 +135,7 @@ agent_brain.agent_loop = lambda task, workspace=None, on_event=None, system_prom
     messages=None, tag="agent", **_: (
         make_result(seq2.pop(0), []) if (system_prompt or '').startswith(agent_validator.VALIDATOR_PROMPT)
         else make_result("attempted answer"))
-agent_worker.handle_message(RAW.replace(b"<orig@", b"<orig2@"), seq=10)
+agent_worker.run(agent_inbox.envelope_from_bytes(RAW.replace(b"<orig@", b"<orig2@"), seq=10))
 ok = len(sent) == 1 and sent[0]["from_addr"] == "agent1@agents.local"
 print(("PASS" if ok else "FAIL"), f" failed review sends ONE email, not two: got {len(sent)}")
 all_ok &= ok

@@ -12,36 +12,25 @@ Run:  python agent_worker.py            # loops forever
       python agent_worker.py --once     # one poll cycle, then exit (handy while debugging)
 """
 
-import email
-import email.utils
-import json
 import mimetypes
 import os
-import re
-import smtplib
-import ssl
 import sys
 import time
 import traceback
-from email.header import decode_header, make_header
-from email.message import EmailMessage
-from imaplib import IMAP4, IMAP4_SSL
 
 import agent_brain
 import agent_budget
 import agent_delivery
+import agent_inbox
 import agent_notes
+import agent_outbox
 import agent_validator
 import fleet_identity
 
 # ---- Config -----------------------------------------------------------------
-IMAP_HOST = os.environ.get("IMAP_HOST", "mailserver")
-IMAP_PORT = int(os.environ.get("IMAP_PORT", "143"))
-IMAP_SSL = os.environ.get("IMAP_SSL", "false").lower() == "true"
-SMTP_HOST = os.environ.get("SMTP_HOST", "mailserver")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
-SMTP_SSL = os.environ.get("SMTP_SSL", "false").lower() == "true"
-
+# The transports own their own configuration now: IMAP and the \Seen/dedupe machinery live in
+# agent_inbox, SMTP in agent_outbox. What is left here is the work, not the plumbing.
+#
 # Identity is derived from TENANT and AGENT_NAME in one place — see fleet_identity for why
 # four independent environment variables for one identity was a bug waiting to be typed.
 AGENT_ADDRESS = fleet_identity.AGENT_ADDRESS
@@ -50,23 +39,6 @@ AGENT_NAME = fleet_identity.NAME
 # grading its own homework. It only ever sends — it has no inbox to poll and no password.
 VALIDATOR_ADDRESS = fleet_identity.VALIDATOR_ADDRESS
 VALIDATOR_NAME = fleet_identity.VALIDATOR_NAME
-# Not derived: a secret is issued, never computed.
-AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "")
-# Sending is a separate credential from reading: inside the compose bridge the mail server
-# relays for trusted containers with no auth at all (port 25), so SMTP_USER stays empty.
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-# LAN-only MVP: the mail server has no real certificate. Opportunistic STARTTLS is still
-# worth having, but it must not fail the send over an unverifiable self-signed cert.
-TLS_VERIFY = os.environ.get("TLS_VERIFY", "false").lower() == "true"
-
-
-def tls_context():
-    ctx = ssl.create_default_context()
-    if not TLS_VERIFY:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
 
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
 # How many times a reply may be sent back for review before we give up and mail it anyway,
@@ -78,69 +50,11 @@ APP_HOST = os.environ.get("APP_HOST", "192.168.0.21")
 APP_PORT_BASE = int(os.environ.get("APP_PORT_BASE", "3000"))
 APP_PORT_COUNT = int(os.environ.get("APP_PORT_COUNT", "10"))
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
-STATE_FILE = os.environ.get("STATE_FILE", os.path.join(WORKSPACE_ROOT, ".processed.json"))
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "40000"))
 
 
 def log(msg):
     print(f"[worker] {msg}", flush=True)
-
-
-# ---- Idempotency ------------------------------------------------------------
-# Belt and braces. The \Seen flag is set BEFORE the task runs (so a crash mid-build can
-# never re-trigger a build), and every Message-ID is also recorded on disk so a restored
-# mailbox or a lost flag can't make us do the same job twice.
-def load_processed():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except (OSError, ValueError):
-        return set()
-
-
-def save_processed(ids):
-    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f)
-    os.replace(tmp, STATE_FILE)
-
-
-# ---- Mail parsing -----------------------------------------------------------
-def decode(value):
-    if not value:
-        return ""
-    try:
-        return str(make_header(decode_header(value)))
-    except Exception:
-        return value
-
-
-def plain_body(msg):
-    """Best-effort plain text of an email: prefer text/plain, else de-tag the HTML."""
-    def payload(part):
-        raw = part.get_payload(decode=True) or b""
-        charset = part.get_content_charset() or "utf-8"
-        return raw.decode(charset, "replace")
-
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain" and "attachment" not in str(
-                part.get("Content-Disposition", "")
-            ):
-                return payload(part)
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                return re.sub(r"<[^>]+>", " ", payload(part))
-        return ""
-    if msg.get_content_type() == "text/html":
-        return re.sub(r"<[^>]+>", " ", payload(msg))
-    return payload(msg)
-
-
-def slug(text, limit=40):
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
-    return (s[:limit] or "task").strip("-")
 
 
 # ---- Reporting --------------------------------------------------------------
@@ -463,78 +377,43 @@ def collect_attachments(root, since, task_workspace=None):
     return files, note
 
 
-def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, references=None,
-              attachments=None):
-    """Put one message on the wire and return its Message-ID.
-
-    Split out from send_reply so a SECOND identity can use it: the reviewer signs off from its
-    own mailbox, and the Message-ID comes back so its note can be threaded underneath the
-    worker's reply rather than floating loose in the inbox.
-    """
-    reply = EmailMessage()
-    reply["Subject"] = subject
-    reply["From"] = f"{from_name} <{from_addr}>"
-    reply["To"] = to
-    reply["Date"] = email.utils.formatdate(localtime=True)
-    mid = email.utils.make_msgid(domain=from_addr.split("@")[-1])
-    reply["Message-ID"] = mid
-    if in_reply_to:
-        reply["In-Reply-To"] = in_reply_to
-        reply["References"] = " ".join(filter(None, [references, in_reply_to]))
-    reply.set_content(body)
-    for name, data in attachments or []:
-        ctype, _ = mimetypes.guess_type(name)
-        maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
-        reply.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
-
-    if SMTP_SSL:
-        smtp = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=60, context=tls_context())
-    else:
-        smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
-    with smtp:
-        smtp.ehlo()
-        if not SMTP_SSL and smtp.has_extn("starttls"):
-            smtp.starttls(context=tls_context())
-            smtp.ehlo()
-        if SMTP_USER:
-            smtp.login(SMTP_USER, SMTP_PASSWORD)
-        smtp.send_message(reply)
-    log(f"sent {from_addr} -> {to}: {subject!r}")
-    return mid
-
-
-def send_reply(original, body, attachments=None):
-    """The worker's answer, threaded under the email that asked for it."""
-    subject = decode(original.get("Subject")) or "(no subject)"
-    return send_mail(
-        to=original.get("Reply-To") or original.get("From"),
-        subject=subject if subject.lower().startswith("re:") else f"Re: {subject}",
-        body=body,
-        from_name=AGENT_NAME,
-        from_addr=AGENT_ADDRESS,
-        in_reply_to=original.get("Message-ID"),
-        references=original.get("References"),
-        attachments=attachments,
-    )
-
-
 # ---- One task ---------------------------------------------------------------
-def handle_message(raw, seq):
-    msg = email.message_from_bytes(raw)
-    sender = decode(msg.get("From"))
-    subject = decode(msg.get("Subject")) or "(no subject)"
+def task_seq(task_id):
+    """The sequence number out of a task id ("task-0037-build-a-thing" -> 37).
+
+    Only used to spread the fallback port choice deterministically, so any stable integer
+    would do; reading it back out of the id keeps the worker from needing a counter of its own.
+    """
+    try:
+        return int(task_id.split("-")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def run(envelope):
+    """Do one task, end to end, from an envelope — never from a message.
+
+    Every check below reads an envelope field. That is the whole substance of D3: the loop
+    guard used to parse a From header, dedupe used to read Message-ID, threading used to walk
+    References. Those checks would all have had to be rewritten the day a task arrived from
+    something that is not mail, which is the worst possible code to be rewriting.
+    """
+    sender = envelope.requester
+    subject = envelope.subject
 
     # Loop guard: never take orders from ourselves (bounces, self-CCs, mailing loops).
-    if AGENT_ADDRESS.lower() in email.utils.parseaddr(msg.get("From", ""))[1].lower():
+    # `requester` is whatever the transport resolved the asker to. It is still sender-supplied
+    # today; D6 replaces that with an authenticated principal, and this line does not change.
+    if AGENT_ADDRESS.lower() in sender.lower():
         log(f"ignoring mail from self: {subject!r}")
         return
 
-    workspace = os.path.join(WORKSPACE_ROOT, f"task-{seq:04d}-{slug(subject)}")
+    workspace = os.path.join(WORKSPACE_ROOT, envelope.task_id)
     # Hand out a port nothing is listening on. The old rule cycled base + seq%count and killed
     # the incumbent, which is fine for throwaways and fatal once the agent maintains what it
     # built — task 22 would have shot task 12's booking app to make room for a scratch server.
     ports = [APP_PORT_BASE + i for i in range(APP_PORT_COUNT)]
-    port, evicted = agent_notes.free_port(ports, fallback_index=seq)
+    port, evicted = agent_notes.free_port(ports, fallback_index=task_seq(envelope.task_id))
     if evicted:
         log(f"all {APP_PORT_COUNT} app ports are busy — evicting whatever holds {port}")
         log(agent_brain.run_bash(f"lsof -t -i:{port} | xargs -r kill -9 || true").replace("\n", " "))
@@ -570,7 +449,7 @@ def handle_message(raw, seq):
 
     # THE REQUEST — what actually arrived, plus the two facts that are specific to this task.
     task = (
-        f"{subject}\n\n{plain_body(msg).strip()}".strip()
+        f"{subject}\n\n{envelope.body}".strip()
         + "\n\n---\n"
         "(Notes about your machine, not part of what was asked. Do not treat these as "
         "requirements and do not quote them back.)\n"
@@ -591,7 +470,7 @@ def handle_message(raw, seq):
 
     # Scopes every LLM call from here on to this task and this requester, so the ledger can
     # answer "what did that email cost?" rather than only "what did today cost?".
-    agent_budget.start_task(os.path.basename(workspace), requester=sender)
+    agent_budget.start_task(envelope.task_id, requester=sender)
 
     before = agent_notes.digest()
     started = time.time()          # anything newer than this in the workspace, the task made
@@ -633,8 +512,8 @@ def handle_message(raw, seq):
                                         "workspace. The files are still there.")
 
     try:
-        reply_mid = send_reply(msg, build_report(result, workspace, review, attach_note),
-                               attachments)
+        reply_mid = agent_outbox.deliver(
+            envelope, build_report(result, workspace, review, attach_note), attachments)
     except Exception:
         log(f"COULD NOT SEND REPLY:\n{traceback.format_exc()}")
         return
@@ -644,15 +523,8 @@ def handle_message(raw, seq):
     # second email would just say the same thing twice. Threaded under the reply it approved.
     if review and review["passed"]:
         try:
-            send_mail(
-                to=msg.get("Reply-To") or msg.get("From"),
-                subject=f"Reviewed: {subject}",
-                body=build_review_email(review, subject),
-                from_name=VALIDATOR_NAME,
-                from_addr=VALIDATOR_ADDRESS,
-                in_reply_to=reply_mid,
-                references=" ".join(filter(None, [msg.get("References"), msg.get("Message-ID")])),
-            )
+            agent_outbox.deliver_review(
+                envelope, build_review_email(review, subject), under=reply_mid)
         except Exception:
             log(f"COULD NOT SEND REVIEW EMAIL:\n{traceback.format_exc()}")
 
@@ -712,71 +584,10 @@ def run_review_gate(task, result, workspace, standing=""):
 
 
 # ---- The inbox loop ---------------------------------------------------------
-def drain_inbox(processed):
-    """Take every unread message off the inbox and return the raw ones worth running.
-
-    Deliberately does NOT run the tasks: a build takes minutes to tens of minutes, and
-    Dovecot will close an idle IMAP connection out from under us long before a slow one
-    finishes. Grab the mail, flag it, hang up — then build.
-    """
-    # The kill switch is checked here, before the connection, precisely so that a paused fleet
-    # consumes nothing: no fetch, no \Seen, no dedupe entry. The backlog is untouched and
-    # arrives in order once a human removes the file.
-    if agent_budget.paused():
-        log(f"PAUSED: {agent_budget.PAUSE_FILE} exists — not fetching mail. Remove it to resume.")
-        return []
-    if IMAP_SSL:
-        imap = IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=tls_context())
-    else:
-        imap = IMAP4(IMAP_HOST, IMAP_PORT)
-    fresh = []
-    try:
-        if not IMAP_SSL and "STARTTLS" in imap.capabilities:
-            imap.starttls(ssl_context=tls_context())
-        imap.login(AGENT_ADDRESS, AGENT_PASSWORD)
-        # Check SELECT explicitly: imaplib returns ('NO', ...) instead of raising, and the
-        # next SEARCH then fails with a baffling "illegal in state AUTH". Dovecot answers NO
-        # for the first few seconds after it starts, before the maildir is ready.
-        typ, data = imap.select("INBOX")
-        if typ != "OK":
-            log(f"INBOX not selectable yet ({data}) — will retry")
-            return fresh
-        typ, data = imap.search(None, "UNSEEN")
-        uids = data[0].split() if typ == "OK" and data and data[0] else []
-        if not uids:
-            return fresh
-        log(f"{len(uids)} unread message(s)")
-
-        for uid in uids:
-            # PEEK so fetching doesn't implicitly consume the message, then mark \Seen
-            # ourselves BEFORE running it: at-most-once beats at-least-once when the
-            # side effect is "an agent builds software and emails a human".
-            typ, data = imap.fetch(uid, "(BODY.PEEK[])")
-            if typ != "OK" or not data or not isinstance(data[0], tuple):
-                log(f"could not fetch uid {uid!r}")
-                continue
-            raw = data[0][1]
-            imap.store(uid, "+FLAGS", "\\Seen")
-
-            mid = email.message_from_bytes(raw).get("Message-ID", "").strip()
-            if mid and mid in processed:
-                log(f"already handled {mid} — skipping")
-                continue
-            if mid:
-                processed.add(mid)
-                save_processed(processed)
-            fresh.append(raw)
-    finally:
-        try:
-            imap.logout()
-        except Exception:
-            pass
-    return fresh
-
-
 def poll_once(processed):
-    for raw in drain_inbox(processed):
-        handle_message(raw, seq=len(processed))
+    # One line, and it is the seam: swap agent_inbox for a broker and nothing below moves.
+    for envelope in agent_inbox.fetch(processed):
+        run(envelope)
 
 
 def port_config_report(published=None):
@@ -810,10 +621,10 @@ def port_config_report(published=None):
 def main():
     once = "--once" in sys.argv
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-    processed = load_processed()
-    log(f"{AGENT_NAME} <{AGENT_ADDRESS}> watching {IMAP_HOST}:{IMAP_PORT} "
+    processed = agent_inbox.load_processed()
+    log(f"{AGENT_NAME} <{AGENT_ADDRESS}> watching {agent_inbox.IMAP_HOST}:{agent_inbox.IMAP_PORT} "
         f"every {POLL_SECONDS}s | model={agent_brain.MODEL} | workspaces={WORKSPACE_ROOT}")
-    if not AGENT_PASSWORD:
+    if not agent_inbox.AGENT_PASSWORD:
         log("WARNING: AGENT_PASSWORD is empty — IMAP login will almost certainly fail.")
     if not os.environ.get("DEEPSEEK_API_KEY"):
         log("WARNING: DEEPSEEK_API_KEY is not set — every task will abort.")
@@ -823,7 +634,7 @@ def main():
     while True:
         try:
             poll_once(processed)
-        except (IMAP4.error, OSError) as e:
+        except (agent_inbox.IMAP4.error, OSError) as e:
             log(f"mail server not reachable ({e}) — retrying in {POLL_SECONDS}s")
         except Exception:
             log(f"unexpected error in poll cycle:\n{traceback.format_exc()}")

@@ -9,3 +9,6 @@ tests/out*/
 # produced them, not to this repo — the canonical copies live in OneDrive.
 option-trading-book*.txt
 option-trading-book*.md
+
+# Git Bash on Windows turns a stray `> nul` into a real zero-byte file.
+nul

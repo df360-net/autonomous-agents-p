@@ -11,7 +11,7 @@ import os, sys, types, email
 
 os.environ.update({"WORKSPACE_ROOT": os.path.join(os.path.dirname(__file__), "ws3")})
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import agent_brain, agent_validator, agent_worker
+import agent_brain, agent_outbox, agent_validator, agent_worker
 
 all_ok = True
 
@@ -281,14 +281,14 @@ class FakeSMTP:
     def send_message(self, m): captured["msg"] = m
 
 
-agent_worker.smtplib = types.SimpleNamespace(SMTP=FakeSMTP, SMTP_SSL=FakeSMTP)
+agent_outbox.smtplib = types.SimpleNamespace(SMTP=FakeSMTP, SMTP_SSL=FakeSMTP)
 
 files, note = agent_worker.collect_attachments(WS, started)
 result = {"answer": "---EMAIL---\nHi Jianmin,\n\nThe book is attached.", "steps": 12,
           "stopped": "final", "transcript": [{"tool": "write_file", "by": "worker",
                                               "args": {"path": "option-trading-book.txt"}}]}
 body = agent_worker.build_report(result, WS, None, note)
-agent_worker.send_mail("boss@agents.local", "Re: book", body, "agent1", "agent1@agents.local",
+agent_outbox.send_mail("boss@agents.local", "Re: book", body, "agent1", "agent1@agents.local",
                        attachments=files)
 
 sent = captured["msg"]
