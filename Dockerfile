@@ -20,8 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The brain writes files as the agent; keep it off root's home but don't fight permissions
 # on a single-tenant container — the blast radius is the container itself.
 WORKDIR /app
-COPY agent_brain.py agent_delivery.py agent_notes.py agent_validator.py agent_worker.py \
-     ship_app.py /app/
+# Every module, by wildcard. An explicit list was silently wrong for days: five new modules
+# were added and hot-patched into the running container, so everything worked — right up until
+# the first rebuild, which produced an image missing agent_budget and crash-looped on import.
+# A list you have to remember to update is a list that will be out of date, and this one could
+# only fail at the moment you were relying on it most.
+COPY *.py /app/
+# The tests ship too. They are the only way to check a rebuilt image before trusting it, and
+# copying them in by hand after every rebuild has the same "remember to" problem as above.
+COPY tests/ /app/tests/
 
 # `ship_app` is the agent's only sanctioned route to GitHub — a command on PATH rather than
 # instructions to hand-roll git remotes and API calls. See ship_app.py for why.
