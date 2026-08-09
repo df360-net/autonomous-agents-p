@@ -29,6 +29,8 @@ import urllib.request
 from html import unescape
 
 import agent_budget
+import agent_peer
+import agent_principal
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -318,6 +320,51 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "message_agent",
+            "description": (
+                "Send a message to ANOTHER AGENT in this fleet — not to a person. Use it to "
+                "ask a peer to review something you built, to ask a question about an app "
+                "they own and you do not, or to hand over work that is genuinely theirs. "
+                "Run `list_dir` on your memory's agents/ directory or read your notes if you "
+                "are unsure who exists.\n"
+                "\n"
+                "THIS IS ASYNCHRONOUS. The other agent is a separate container polling its "
+                "own mailbox; it will answer minutes or hours later, long after this task has "
+                "finished. You will NOT see a reply during this task. Send the message, then "
+                "finish your work and say in your reply that you asked them — never wait for "
+                "an answer, and never invent one.\n"
+                "\n"
+                "Every message is copied to the human who runs this fleet, so write it as "
+                "something they can follow: what you want, and why. You cannot turn that off. "
+                "Do not use this to talk to people, and do not use it to ask another agent to "
+                "do your own task for you."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string",
+                           "description": "The other agent's name, e.g. 'agent1'. Not an "
+                                          "email address and not a person."},
+                    "purpose": {"type": "string",
+                                "enum": list(agent_principal.PURPOSES),
+                                "description": "Why you are writing. 'review-request' to ask "
+                                               "for a check of your work, 'question' to ask "
+                                               "something, 'task' to hand over work that is "
+                                               "theirs, 'answer'/'review-result' when "
+                                               "responding to one of theirs."},
+                    "subject": {"type": "string", "description": "One line, specific."},
+                    "body": {"type": "string",
+                             "description": "The message. Include enough context to act on "
+                                            "it cold — paths, ports, repo names — because "
+                                            "they cannot see your workspace."},
+                },
+                "required": ["to", "purpose", "subject", "body"],
+            },
+        },
+    },
 ]
 
 
@@ -508,6 +555,10 @@ def web_search(query, count=8):
 
 DISPATCH = {
     "read_file": read_file,
+    # Implemented in agent_peer, not here: the hop count, the signature and the CC to the boss
+    # are all decided from state the model cannot reach, and putting the function in this file
+    # would put that state one namespace away from the arguments the model supplies.
+    "message_agent": lambda **kw: agent_peer.send(**kw),
     "list_dir": list_dir,
     "run_bash": run_bash,
     "write_file": write_file,

@@ -233,6 +233,21 @@ def admit(envelope):
     if _is_self(clean):
         return Decision(False, principal, clean, "mail from this agent's own mailbox")
 
+    # 3b. MAIL FROM A FLEET MAILBOX MUST BE SIGNED. Without this, an unsigned message from
+    #     agent1 arrives at agent2 as an ordinary HUMAN request: hops forced to 0, purpose
+    #     stripped, and the hop-based loop guard therefore never engages — only thread depth
+    #     would eventually stop an A -> B -> A ping-pong. The self-check above does not catch
+    #     it, because agent1's address is not agent2's own.
+    #
+    #     Refusing on a sender-controlled field does NOT break D6's rule. The rule forbids
+    #     GRANTING on one. Denying is fail-closed: a stranger forging `From: agent1@` is
+    #     refused, which is the outcome we want, and a real agent is unaffected because a real
+    #     agent signs.
+    if principal.kind == "human" and _address(clean.requester) in fleet_identity.fleet_addresses():
+        return Decision(False, principal, clean,
+                        f"{_address(clean.requester)} is a fleet mailbox but the message is "
+                        f"not signed — an agent that cannot prove it is one is not one")
+
     # 4. WHO MAY ASK. Attested agents are governed by holding a key, which is strictly stronger
     #    than an address match, so the address allow-list applies to people.
     if principal.kind == "human" and not sender_allowed(clean.requester):

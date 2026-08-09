@@ -77,6 +77,17 @@ x-agent-env: &agent-env
   # agent2 arrives. One fleet key now; FLEET_HMAC_SECRET_DEV_AGENT2 overrides per agent,
   # which is the seam the control plane grows into.
   FLEET_HMAC_SECRET: "${FLEET_HMAC_SECRET:-}"
+  # AGENT-TO-AGENT MAIL (agent_peer.py). Who exists in this tenant, and who is copied on every
+  # word that passes between them. The peer list is what `message_agent` validates against and
+  # what lets admission refuse UNSIGNED mail from a fleet mailbox — so an agent added here but
+  # not given the HMAC key can neither send nor be believed, which is the safe order.
+  # The CC is not a preference: agents talking with nobody watching is the failure this
+  # prevents, and it is enforced in agent_peer.send(), not in the prompt.
+  FLEET_PEERS: "${FLEET_PEERS:-agent1,agent2}"
+  BOSS_ADDRESS: "${BOSS_ADDRESS:-boss@agents.local}"
+  # Hops bound how DEEP a chain of agent messages can go; this bounds how WIDE one task can
+  # fan out. Five is generous for "ask a peer to review this" and far short of a loop.
+  AGENT_MAX_PEER_SENDS: "${AGENT_MAX_PEER_SENDS:-5}"
   # MEMORY (agent_memory.py, D5). The agent's notes are a git repo outside the container,
   # which is what makes the container disposable:
   #   docker compose rm -f -v agent1 && docker compose up -d agent1

@@ -25,6 +25,7 @@ import agent_inbox
 import agent_memory
 import agent_notes
 import agent_outbox
+import agent_peer
 import agent_principal
 import agent_validator
 import fleet_identity
@@ -392,6 +393,32 @@ def task_seq(task_id):
         return 0
 
 
+def peer_note():
+    """The standing paragraph about colleagues. Empty when this agent is alone in the fleet —
+    an agent told it has colleagues it does not have will offer to consult them."""
+    peers = agent_peer.peers()
+    if not peers:
+        return ("\n--- YOUR COLLEAGUES ---\n"
+                "You are the only agent in this fleet at the moment, so `message_agent` has "
+                "nobody to write to. Do the work yourself.")
+    return (
+        "\n--- YOUR COLLEAGUES ---\n"
+        f"Other agents work alongside you in tenant {fleet_identity.TENANT}: "
+        f"{', '.join(peers)}. Each runs in its own container with its own workspace, and "
+        "reaches its own mailbox — you cannot see their files and they cannot see yours.\n"
+        "You share AGENT.md and AGENT-AVOID.md with them: lessons you write go to all of "
+        "them, and some of what you read there was written by one of them on a DIFFERENT "
+        "machine. AGENT-ASSETS.md is yours alone, so what you built is not in their inventory "
+        "and what they built is not in yours.\n"
+        "Use `message_agent` to ask one of them something — most usefully to review work you "
+        "are unsure of, or when a task concerns an app THEY built and you did not (you cannot "
+        "push to their repositories; ship_app will refuse). It is email, so the answer comes "
+        "back long after this task has ended.\n"
+        f"Every message between agents is copied to {agent_peer.BOSS_ADDRESS}, always. Write "
+        "them as something a human reads over your shoulder, because one does."
+    )
+
+
 def run(envelope):
     """Do one task, end to end, from an envelope — never from a message.
 
@@ -456,6 +483,12 @@ def run(envelope):
         "\n"
         f"{agent_notes.UPKEEP_NOTE}\n"
         "\n"
+        # Who else exists. The agent cannot discover this: its own notes are about its own
+        # machine, and nothing else in the prompt names another agent. Kept to the facts —
+        # the tool description carries the mechanics, and this is the standing context that
+        # tells it there is anybody to use the tool on.
+        f"{peer_note()}\n"
+        "\n"
         "--- DELIVERY ---\n"
         # Built from the assets file so the suggested app slot accounts for what is already
         # deployed, and suppressed entirely when there is no token — an agent told to ship
@@ -487,6 +520,10 @@ def run(envelope):
     # Scopes every LLM call from here on to this task and this requester, so the ledger can
     # answer "what did that email cost?" rather than only "what did today cost?".
     agent_budget.start_task(envelope.task_id, requester=sender)
+    # Binds the hop count and thread of THIS task so `message_agent` can increment from them.
+    # The agent never sees these values and cannot reach them from a tool argument, which is
+    # the only reason the hop limit means anything.
+    agent_peer.start_task(envelope, principal)
 
     before = agent_notes.digest()
     started = time.time()          # anything newer than this in the workspace, the task made
@@ -531,9 +568,14 @@ def run(envelope):
         attachments, attach_note = [], ("NOT ATTACHED: the harness could not read the "
                                         "workspace. The files are still there.")
 
+    # When a PEER asked, the answer has to be signed and hop-stamped like the request was —
+    # an unsigned reply arriving back at agent1 is refused by its own admission check, so the
+    # conversation would die silently on the return leg. The boss is copied on that leg too.
+    peer_extras = agent_peer.reply_extras(envelope, principal)
     try:
         reply_mid = agent_outbox.deliver(
-            envelope, build_report(result, workspace, review, attach_note), attachments)
+            envelope, build_report(result, workspace, review, attach_note), attachments,
+            **peer_extras)
     except Exception:
         log(f"COULD NOT SEND REPLY:\n{traceback.format_exc()}")
         return

@@ -87,6 +87,32 @@ AGENT_ADDRESS = address()
 VALIDATOR_NAME = validator_name()
 VALIDATOR_ADDRESS = validator_address()
 
+# ---- The rest of the fleet ---------------------------------------------------
+# Who else exists in this tenant. An explicit list today; the registry (phase 3) replaces the
+# source without changing either caller. It is here rather than in agent_peer because
+# agent_principal needs it too, and a peer list that lived in the sending module would have to
+# be imported by the module that decides whether to trust a sender — which is backwards.
+PEERS = tuple(sorted({n for n in (
+    p.strip() for p in os.environ.get("FLEET_PEERS", "").split(",")) if n and n != NAME}))
+
+
+def peer_id(name):
+    """A peer's agent id. Same tenant by construction: cross-tenant is a control-plane relay."""
+    return f"{TENANT}/{name}"
+
+
+def fleet_addresses():
+    """Every mailbox this fleet owns, including the reviewers'.
+
+    Used to REFUSE unattested mail that claims to come from one of them — never to grant
+    anything. That direction matters: the From header is sender-controlled, so believing it
+    would break D6's rule outright, while disbelieving it is fail-closed. A stranger forging
+    `From: agent1@` gets refused, which is exactly the outcome we want, and a real agent is
+    unaffected because a real agent signs.
+    """
+    names = (NAME,) + PEERS
+    return {address(n).lower() for n in names} | {validator_address(n).lower() for n in names}
+
 
 def check_environment(env=None):
     """A leftover env var that disagrees with the derivation stops the process.

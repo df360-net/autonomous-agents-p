@@ -46,20 +46,39 @@ def tls_context():
     return ctx
 
 
+def new_message_id(from_addr=None):
+    """A Message-ID minted BEFORE the message is built.
+
+    Needed because an agent-to-agent signature covers the id, so the value has to exist before
+    `send_mail` is called and be the same one that goes on the wire. Generating it inside
+    send_mail would sign one id and send another, and the far end would reject every message
+    with a signature that verified against nothing.
+    """
+    return email.utils.make_msgid(domain=(from_addr or AGENT_ADDRESS).split("@")[-1])
+
+
 def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, references=None,
-              attachments=None):
+              attachments=None, cc=None, headers=None, message_id=None):
     """Put one message on the wire and return its Message-ID.
 
     The Message-ID comes back so the reviewer's note can be threaded underneath the worker's
     reply rather than floating loose in the inbox.
+
+    `cc` and `headers` exist for agent-to-agent mail: the boss is copied on every message
+    between agents, and the attestation headers ride along. Both are set by agent_peer, never
+    by anything the model can reach.
     """
     reply = EmailMessage()
     reply["Subject"] = subject
     reply["From"] = f"{from_name} <{from_addr}>"
     reply["To"] = to
+    if cc:
+        reply["Cc"] = cc
     reply["Date"] = email.utils.formatdate(localtime=True)
-    mid = email.utils.make_msgid(domain=from_addr.split("@")[-1])
+    mid = message_id or email.utils.make_msgid(domain=from_addr.split("@")[-1])
     reply["Message-ID"] = mid
+    for key, value in (headers or {}).items():
+        reply[key] = value
     if in_reply_to:
         reply["In-Reply-To"] = in_reply_to
         reply["References"] = " ".join(filter(None, [references, in_reply_to]))
@@ -89,8 +108,13 @@ def _re(subject):
     return subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
 
-def deliver(envelope, body, attachments=None):
-    """The worker's answer, threaded under the request that asked for it."""
+def deliver(envelope, body, attachments=None, cc=None, headers=None, message_id=None):
+    """The worker's answer, threaded under the request that asked for it.
+
+    When the request came from a peer agent the caller passes the attestation headers and the
+    boss's address, so the return leg is signed and witnessed exactly like the outbound one.
+    An unsigned answer would be refused by the peer's own admission check.
+    """
     return send_mail(
         to=envelope.reply_to or envelope.requester,
         subject=_re(envelope.subject or "(no subject)"),
@@ -100,6 +124,9 @@ def deliver(envelope, body, attachments=None):
         in_reply_to=envelope.message_id,
         references=envelope.references,
         attachments=attachments,
+        cc=cc,
+        headers=headers,
+        message_id=message_id,
     )
 
 
