@@ -128,6 +128,17 @@ services:
       # agent2 arrives. One fleet key now; FLEET_HMAC_SECRET_DEV_AGENT2 overrides per agent,
       # which is the seam the control plane grows into.
       - FLEET_HMAC_SECRET=${FLEET_HMAC_SECRET:-}
+      # MEMORY (agent_memory.py, D5). The agent's notes are a git repo outside the container,
+      # which is what makes the container disposable:
+      #   docker compose rm -f -v agent1 && docker compose up -d agent1
+      # comes back knowing everything. /workspace becomes scratch.
+      #   tenant repo  AGENT.md + AGENT-AVOID.md, shared by every agent in the tenant,
+      #                plus agents/<name>/AGENT-ASSETS.md which is private to each
+      #   fleet repo   FLEET.md, read-only — no agent can push it
+      # UNSET DISABLES THE WHOLE THING and notes stay in /workspace exactly as before, which
+      # is the rollback if this misbehaves: comment out one line and recreate the container.
+      - MEMORY_TENANT_REMOTE=${MEMORY_TENANT_REMOTE:-/remotes/dev-knowledge.git}
+      - MEMORY_FLEET_REMOTE=${MEMORY_FLEET_REMOTE:-/remotes/fleet-knowledge.git}
       # Where to tell you the app is. Must be an address YOUR browser can reach — the
       # container's own hostname is useless to you, so this is Zeenie's LAN IP.
       - APP_HOST=${APP_HOST:-192.168.0.21}
@@ -156,9 +167,17 @@ services:
       # nothing is listening. Keep in step with APP_PORT_BASE/APP_PORT_COUNT above.
       - "${APP_PORT_RANGE:-3000-3009}:${APP_PORT_RANGE:-3000-3009}"
     volumes:
-      # Named volume, not a bind mount: the agent's builds are container-owned. Inspect
-      # them with `docker exec -it agent1 bash`, or `docker cp` anything worth keeping.
+      # SCRATCH (D5). Task folders and running apps. Nothing here is precious any more —
+      # the agent's memory moved to /remotes below, so this volume can be deleted and the
+      # agent comes back knowing everything. Inspect it with `docker exec -it agent1 bash`.
       - agent1-workspace:/workspace
+      # THE MEMORY REMOTES, and the only bind mount the agent gets. A host directory rather
+      # than a named volume, deliberately: the point of D5 is that memory outlives every
+      # container, so it should be somewhere you can back up, browse and `git log` from
+      # Windows without docker running at all. Bare repos, created on first start.
+      # Point MEMORY_TENANT_REMOTE at GitHub instead whenever you want it off the laptop —
+      # the agent cannot tell the difference, it is a git remote either way.
+      - ./memory-remotes:/remotes
     restart: unless-stopped
 
 volumes:

@@ -39,8 +39,12 @@ RUN printf '#!/bin/sh\nexec python3 /app/ship_app.py "$@"\n' > /usr/local/bin/sh
     && git config --global init.defaultBranch main \
     && git config --global --add safe.directory '*'
 
-RUN mkdir -p /workspace
-ENV WORKSPACE_ROOT=/workspace
+RUN mkdir -p /workspace /memory
+# /workspace is SCRATCH now (D5): task folders and running apps, none of it precious.
+# /memory holds the git clones of the agent's actual memory, and is rebuilt from the remote on
+# every start — which is what makes the container disposable.
+ENV WORKSPACE_ROOT=/workspace \
+    MEMORY_ROOT=/memory
 
 # -u so docker logs stream live — watching a run is half the point.
 CMD ["python", "-u", "agent_worker.py"]

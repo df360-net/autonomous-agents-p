@@ -12,3 +12,7 @@ option-trading-book*.md
 
 # Git Bash on Windows turns a stray `> nul` into a real zero-byte file.
 nul
+# The agents' memory: bare git repos bind-mounted into the containers (D5). Deliberately NOT
+# in this repo — it is machine state with its own history, and nesting one git repo inside
+# another is how you lose both. Back it up as a folder, or push it to its own remote.
+memory-remotes/

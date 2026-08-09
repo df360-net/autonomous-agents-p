@@ -22,6 +22,7 @@ import agent_brain
 import agent_budget
 import agent_delivery
 import agent_inbox
+import agent_memory
 import agent_notes
 import agent_outbox
 import agent_principal
@@ -417,6 +418,12 @@ def run(envelope):
     sender = envelope.requester
     subject = envelope.subject
 
+    # Pull memory BEFORE the notes are read into the prompt, so this task sees what any other
+    # agent in the tenant learned since the last one. Failure here is logged, not fatal: the
+    # local clone is still there and a task should not die because a git remote is down.
+    for line in agent_memory.sync(WORKSPACE_ROOT, agent_notes.SCOPES):
+        log(line)
+
     workspace = os.path.join(WORKSPACE_ROOT, envelope.task_id)
     # Hand out a port nothing is listening on. The old rule cycled base + seq%count and killed
     # the incumbent, which is fine for throwaways and fatal once the agent maintains what it
@@ -504,6 +511,10 @@ def run(envelope):
     # Diagnostic only — nothing depends on it, but "did it keep its own notes up to date?" is
     # the one question this whole mechanism turns on, and it should be answerable from the log.
     log("notes " + agent_notes.describe_digest(before, agent_notes.digest()))
+    # Push whatever it wrote, as the harness rather than as the agent. Durability must not
+    # depend on the model remembering a step at the end of a long task — the same reason the
+    # budget check lives inside call_llm instead of in the prompt.
+    log(agent_memory.publish(envelope.task_id, note=f"task: {subject}\nrequester: {sender}"))
 
     # Collected after the review gate so a reworked deliverable is the one that ships. Never
     # let a failure here cost the reply itself — an email with no attachment still carries the
@@ -637,7 +648,12 @@ def main():
         log("WARNING: AGENT_PASSWORD is empty — IMAP login will almost certainly fail.")
     if not os.environ.get("DEEPSEEK_API_KEY"):
         log("WARNING: DEEPSEEK_API_KEY is not set — every task will abort.")
-    for line in port_config_report() + agent_principal.startup_report():
+    # Memory first, and NOT inside the poll loop's exception handler: sync() exits the process
+    # when there is neither a remote nor a local clone, and that exit has to happen here where
+    # it is visible in `docker logs`, not be swallowed as a bad poll cycle.
+    for line in agent_memory.sync(WORKSPACE_ROOT, agent_notes.SCOPES):
+        log(line)
+    for line in port_config_report() + agent_principal.startup_report() + [agent_memory.status()]:
         log(line)
 
     while True:

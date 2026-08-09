@@ -199,6 +199,37 @@ Today's three files map cleanly: most of `AGENT-AVOID.md` (25,791 chars of machi
 tenant-or-global; `AGENT-ASSETS.md` stays personal; `AGENT.md` splits between environment facts
 and working conventions.
 
+**Built as `agent_memory.py`, with two deliberate departures from the above.**
+
+*No `note_write` tool.* The agent keeps writing plain files with ordinary tools; the **harness**
+commits and pushes at the end of every task. Durability must not depend on the model remembering
+to call something — the same reason the budget check lives inside `call_llm` and not in the
+prompt. It also preserves the property the notes mechanism actually runs on: the agent owns these
+files and no format is imposed on them. A tool call is a format.
+
+*No `flock`.* flock coordinates processes on one machine, and the concurrency that matters is two
+agents in different containers pushing to one tenant repo. That is pull-rebase-and-retry plus a
+`*.md merge=union` driver, so two agents appending to the same notes file merge instead of
+conflicting. flock would have looked correct at N=1 and failed at exactly the moment N=2 made it
+necessary.
+
+Scope is assigned by the harness, not the agent — "is this lesson mine or the fleet's?" is a
+question about blast radius. `AGENT.md` and `AGENT-AVOID.md` are tenant; `AGENT-ASSETS.md` is
+personal, because it is a list of things this agent *runs*, and shared it makes "fix the booking
+app" ambiguous between two agents who both believe they own it.
+
+*Failure posture:* unreachable remote with a local clone → work offline, commit locally, push with
+the next task. Unreachable remote and **no** local clone → refuse to start. An agent with amnesia
+does not do less work, it does the *wrong* work — it redeploys apps it already runs.
+
+Two bugs worth recording, both found by tests written against real git rather than a mock:
+`-c merge.union.driver=true` does **not** enable the union merge — `union` is a built-in, and
+defining `merge.union.driver` *replaces* it with a custom driver running `true`, which exits 0 and
+silently discards the second agent's notes. And a clone that `git init`s before it fetches leaves a
+valid-looking empty repo behind when the fetch fails, so the next start finds "memory" and runs
+with none — arriving at the exact amnesia the module refuses, by the failure path. Cloning is now
+atomic via a staging directory.
+
 ### D6 — Principal resolution, and the rule
 
 Every inbound envelope and control-plane request resolves to a `Principal{agent_id, tenant}`
@@ -434,7 +465,9 @@ requester and cost per task.
 
 ### Phase 2 — External state, name addressing, the second agent
 
-6. Memory → git remote, three scopes; `/workspace` becomes scratch only. *(D5)*
+6. ✅ Memory → git remote, three scopes; `/workspace` becomes scratch only. *(D5)* — remotes are
+   bare repos bind-mounted from the host today, so nothing leaves the laptop; repointing
+   `MEMORY_TENANT_REMOTE` at GitHub is a one-line change the agent cannot detect.
 7. `preview.request()` + router + wildcard hostnames; **no agent publishes a host port.**
 8. Kill slot integers; apps addressed `<tenant>/<app>`. *(D4)*
 9. Stand up `dev/agent-02` — an env file, a mailbox, a memory clone. Nothing else. *That is the
