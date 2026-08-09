@@ -9,7 +9,11 @@ standard those two are held to. Every decision in phases 1–2 is justified agai
 because the point of this document is not a bigger plan — it is knowing **which decisions are
 cheap now and expensive later**.
 
-*Status: 2026-08-09. Nothing in this document is built yet. It supersedes §14 (Roadmap) of the
+*Status: 2026-08-09. **Phase 1 is complete** — D1 (`fleet_identity.py`), D3 (`TaskEnvelope`,
+`agent_inbox.py`, `agent_outbox.py`, `run(envelope)`), D7 (`agent_budget.py`) and D6
+(`agent_principal.py`) are built, tested and running on Zeenie as one agent. Item 5 (notes to
+the front of the prompt) is measured and done. Phase 2 has not started. Everything from D2, D4,
+D5 and D8 onward is still design. It supersedes §14 (Roadmap) of the
 main design doc and corrects two of its assumptions — see §12. Companion documents:
 [Autonomous-Agents-Design.md](Autonomous-Agents-Design.md) (the system as it exists),
 [agent-reminder.md](../agent-reminder.md) (context handoff).*
@@ -209,6 +213,25 @@ encoding* of `envelope.hops` and `envelope.agent_id`; the check reads the envelo
 envelope is attested. At N=2 on a LAN the difference is invisible — which is precisely why it must
 be settled now, while it costs nothing.
 
+**Built as `agent_principal.py`.** `admit(envelope)` resolves a `Principal{kind, principal_id,
+tenant, attested}` and returns a **sanitised copy** of the envelope: anything the sender could
+have written and did not sign for is put back to its default before the worker ever sees it. A
+message that *claims* to be an agent and cannot prove it is **refused, not downgraded to human** —
+downgrading turns a spoof into an accepted task, and no real person's mail client sets
+`X-Agent-Id`. Refusals are logged and dropped, never answered: a refusal that replies can be
+aimed at a third party, and if the cause was a loop, the reply is another lap.
+
+Two loop guards, because they fail differently. `hops` catches machine traffic and is only ever
+non-zero on an attested envelope. **Thread depth** catches loops that carry no counter at all — a
+forwarding rule, a mailing list, an out-of-office responder — because `References` grows by one on
+every pass and never shrinks. A hop counter alone would not have seen those.
+
+`secret_for(agent_id)` is the seam: one fleet-wide HMAC key today, per-agent keys from the control
+plane next, `TokenReview` or SPIFFE after that, with no call site changing. With **no key
+configured — today's state — all agent-to-agent traffic is refused**, which is the correct posture
+for a fleet that has no peer traffic yet. Replay is handled where it already was, by the
+Message-ID dedupe in `agent_inbox`.
+
 Agent-to-agent messages are **relayed and attested by the control plane**, not sent peer-to-peer.
 That puts authentication, the audit log and hop enforcement in one place.
 
@@ -380,17 +403,22 @@ hand at 3am without Docker Desktop running.
 
 Phases 1–2 deliver **two agents on Zeenie** and nothing more.
 
-### Phase 1 — Reshape the primitives (still one agent; no user-visible change)
+### Phase 1 — Reshape the primitives (still one agent; no user-visible change) — **COMPLETE**
 
 Done while there is one agent, ~5 apps, and no history to migrate.
 
-1. `fleet_identity.py`; rename to `dev/agent-01`; `AGENT_NAME`/`AGENT_ADDRESS` become derived. *(D1)*
-2. `TaskEnvelope` + `agent_inbox.py` + `agent_outbox.py`; `handle_message` → `run(envelope)`. *(D3)*
-3. `Principal` resolution (HMAC) and the no-sender-controlled-fields rule; loop guard, allow-list,
-   hop count and thread depth all enforced on envelope fields. *(D6)*
-4. `agent_budget.py` with the full ledger schema, `usage` capture in `call_llm`, ceilings,
+1. ✅ `fleet_identity.py`; `AGENT_NAME`/`AGENT_ADDRESS` become derived. *(D1)* — the rename to
+   `dev/agent-01` was **dropped**: it costs a new mailbox and a changed address for the human, and
+   `dev/agent1` already satisfies the only thing D1 was for, which is that the id be
+   tenant-qualified from the first ledger row.
+2. ✅ `TaskEnvelope` + `agent_inbox.py` + `agent_outbox.py`; `handle_message` → `run(envelope)`.
+   *(D3)*
+3. ✅ `Principal` resolution (HMAC) and the no-sender-controlled-fields rule; loop guard,
+   allow-list, hop count and thread depth all enforced on envelope fields. *(D6)*
+4. ✅ `agent_budget.py` with the full ledger schema, `usage` capture in `call_llm`, ceilings,
    `BudgetExceeded(LLMError)`, kill switch. *(D7)*
-5. Move the notes block to the **front** of the prompt and measure the cache-hit rate.
+5. ✅ Move the notes block to the **front** of the prompt and measure the cache-hit rate. The
+   measured answer was **not** the predicted one — see §12.
 
 On (5): the notes are currently injected *after* the variable task text, so the 48,565 constant
 characters cannot be cached as a prefix and are re-sent as novel bytes on every call — a recent
@@ -472,10 +500,27 @@ humans are actually mis-routing.
    profile resets to Public and drops port 22; `docker pull`/`build` over SSH is broken. N agents
    multiply "which one didn't come back".
 
+### Answered by measurement
+
+- **Does the provider's context cache actually apply to this prefix?** Yes, and the *rationale in
+  the first draft of this document was wrong.* Within one run the prefix is already byte-identical,
+  so there was never a win to be had there; measured on task-0033, the first call of a conversation
+  was 16–26% cached and every later call was 99%. The real win is across *conversations* — a new
+  one re-sends the whole notes block as novel tokens, and there are two per task because the
+  reviewer starts fresh. A predicted 90% hit rate came out at 45% on first measurement, because
+  that run was the one *filling* the cache and could not have shown a gain — an error in the
+  experiment, not the mechanism.
+- **Is injected memory the cost driver?** No. A real 130-step build that shipped an app cost
+  **$0.4969** at 99% cache hit; a trivial question cost **$0.0093**. The driver is conversation
+  growth, at a 112:1 prompt:completion ratio. This is why the memory-scope work in phase 2 is
+  sequenced for correctness reasons and not cost ones.
+- **Separately discovered:** `NOTES_MAX_CHARS=8000` is applied **per file**, so only 22,360 of
+  48,565 characters of notes are actually injected. About 40% of what the agent wrote to itself is
+  already invisible to it — which is an argument for retrieval (D2) on grounds of *fidelity*, not
+  tokens.
+
 ### Open
 
-- **Does the provider's context cache actually apply to this prefix?** The prefix argument rests on
-  it. Measure before treating the number as real; make the change regardless.
 - **Does the in-container validator survive cross-review?** If it adds nothing once cross-review
   exists, deleting it saves a review round of spend per task.
 - **Auto-retry or human decision on `abandoned`?** Per-tenant policy; default should be human.

@@ -24,6 +24,7 @@ import agent_delivery
 import agent_inbox
 import agent_notes
 import agent_outbox
+import agent_principal
 import agent_validator
 import fleet_identity
 
@@ -398,15 +399,23 @@ def run(envelope):
     References. Those checks would all have had to be rewritten the day a task arrived from
     something that is not mail, which is the worst possible code to be rewriting.
     """
+    # ADMISSION FIRST, before anything else touches this envelope. Who is asking, whether the
+    # machine fields on it are believable, and whether it may run at all — resolved once, in
+    # one place, and never re-litigated below. `admit` hands back a SANITISED envelope; using
+    # the original after this point would put the sender's own claims back in play, so it is
+    # rebound rather than kept alongside.
+    decision = agent_principal.admit(envelope)
+    if not decision.allowed:
+        # Logged and dropped, never answered. A refusal that replies is a refusal that can be
+        # aimed: it turns the agent into a way to send mail to a third party, and if the cause
+        # was a loop, the reply is another lap.
+        log(f"REFUSED {envelope.task_id} from {envelope.requester!r}: {decision.reason}")
+        return
+    envelope = decision.envelope
+    principal = decision.principal
+
     sender = envelope.requester
     subject = envelope.subject
-
-    # Loop guard: never take orders from ourselves (bounces, self-CCs, mailing loops).
-    # `requester` is whatever the transport resolved the asker to. It is still sender-supplied
-    # today; D6 replaces that with an authenticated principal, and this line does not change.
-    if AGENT_ADDRESS.lower() in sender.lower():
-        log(f"ignoring mail from self: {subject!r}")
-        return
 
     workspace = os.path.join(WORKSPACE_ROOT, envelope.task_id)
     # Hand out a port nothing is listening on. The old rule cycled base + seq%count and killed
@@ -466,7 +475,7 @@ def run(envelope):
         "container. Say plainly that it stays up only while the container does. If the task "
         "needs no server, ignore all of this."
     )
-    log(f"TASK from {sender}: {subject!r} -> {workspace} (free port {port})")
+    log(f"TASK from {principal}: {subject!r} -> {workspace} (free port {port})")
 
     # Scopes every LLM call from here on to this task and this requester, so the ledger can
     # answer "what did that email cost?" rather than only "what did today cost?".
@@ -628,7 +637,7 @@ def main():
         log("WARNING: AGENT_PASSWORD is empty — IMAP login will almost certainly fail.")
     if not os.environ.get("DEEPSEEK_API_KEY"):
         log("WARNING: DEEPSEEK_API_KEY is not set — every task will abort.")
-    for line in port_config_report():
+    for line in port_config_report() + agent_principal.startup_report():
         log(line)
 
     while True:

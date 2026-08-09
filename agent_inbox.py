@@ -44,11 +44,13 @@ WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(WORKSPACE_ROOT, ".processed.json"))
 
 # Machine-to-machine headers. These are the TRANSPORT ENCODING of envelope fields, never the
-# thing a decision is made on — see agent_envelope and D6. With SPOOF_PROTECTION off and an
-# open relay on the bridge, anything on the LAN can write them; they are accident controls.
+# thing a decision is made on. With SPOOF_PROTECTION off and an open relay on the bridge,
+# anything on the LAN can write them — which is exactly why they are lifted verbatim here and
+# judged in agent_principal.admit(), the single place allowed to decide what any of it means.
 HDR_AGENT_ID = "X-Agent-Id"
 HDR_HOPS = "X-Agent-Hops"
 HDR_PURPOSE = "X-Agent-Purpose"
+HDR_SIGNATURE = "X-Agent-Signature"
 
 
 def log(msg):
@@ -158,7 +160,8 @@ def envelope_from_bytes(raw, seq):
         references=references,
         hops=hops,
         purpose=(msg.get(HDR_PURPOSE) or "").strip(),
-        from_agent=msg.get(HDR_AGENT_ID) is not None,
+        from_agent_id=(msg.get(HDR_AGENT_ID) or "").strip(),
+        signature=(msg.get(HDR_SIGNATURE) or "").strip(),
         state="submitted",
     )
 

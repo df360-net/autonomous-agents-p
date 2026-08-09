@@ -114,6 +114,20 @@ services:
       - PRICE_CACHE_HIT_PER_M=${PRICE_CACHE_HIT_PER_M:-0.07}
       - PRICE_CACHE_MISS_PER_M=${PRICE_CACHE_MISS_PER_M:-0.27}
       - PRICE_OUTPUT_PER_M=${PRICE_OUTPUT_PER_M:-1.10}
+      # ADMISSION (agent_principal.py). Who may task this agent, and the two loop guards.
+      # ALLOWED_SENDERS is "*" — anyone who can reach the mail server. That is honest about
+      # today (this mail server accepts unauthenticated relay on :25) and it is why the spend
+      # ceilings above are the real bound. Narrow it to "@agents.local,you@example.com" the
+      # moment this box is reachable by anyone you would not hand the API key to.
+      - ALLOWED_SENDERS=${ALLOWED_SENDERS:-*}
+      - AGENT_MAX_HOPS=${AGENT_MAX_HOPS:-3}
+      - AGENT_MAX_THREAD_DEPTH=${AGENT_MAX_THREAD_DEPTH:-20}
+      # The key that makes agent-to-agent messages believable. UNSET TODAY, deliberately: with
+      # no key, every message claiming to come from an agent is refused, which is the correct
+      # posture for a fleet with no peer traffic yet. Set it (same value on both agents) when
+      # agent2 arrives. One fleet key now; FLEET_HMAC_SECRET_DEV_AGENT2 overrides per agent,
+      # which is the seam the control plane grows into.
+      - FLEET_HMAC_SECRET=${FLEET_HMAC_SECRET:-}
       # Where to tell you the app is. Must be an address YOUR browser can reach — the
       # container's own hostname is useless to you, so this is Zeenie's LAN IP.
       - APP_HOST=${APP_HOST:-192.168.0.21}
