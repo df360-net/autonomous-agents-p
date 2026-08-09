@@ -224,13 +224,20 @@ def parse_verdict(answer):
     return False, (answer or "")[m.end():].strip()
 
 
-def review(task, result, workspace, on_event=None):
-    """Returns {"passed": bool, "notes": str, "steps": int, "transcript": [...]}"""
+def review(task, result, workspace, on_event=None, standing=""):
+    """Returns {"passed": bool, "notes": str, "steps": int, "transcript": [...]}
+
+    `standing` is the worker's own notes and the delivery rules. It rides in the reviewer's
+    SYSTEM message rather than in the task text: the reviewer needs those rules to judge a
+    delivery claim, but "the email that was received" should be the email, not the email with
+    the agent's memory stapled to it. It is also the same bytes on every task, so putting it
+    here makes the reviewer's prefix cacheable across tasks — see the note in agent_worker.
+    """
     review_result = agent_brain.agent_loop(
         build_review_task(task, result, workspace),
         workspace=workspace,
         on_event=on_event,
-        system_prompt=VALIDATOR_PROMPT,
+        system_prompt=VALIDATOR_PROMPT + standing,
         tag="reviewer",
     )
     if review_result["stopped"] == "error":

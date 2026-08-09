@@ -535,6 +535,36 @@ def handle_message(raw, seq):
         log(f"all {APP_PORT_COUNT} app ports are busy — evicting whatever holds {port}")
         log(agent_brain.run_bash(f"lsof -t -i:{port} | xargs -r kill -9 || true").replace("\n", " "))
 
+    # STANDING CONTEXT — the same bytes on almost every task: the agent's own notes, the upkeep
+    # duty, the delivery rules. It goes in the SYSTEM message, not the user message, for two
+    # reasons that pull the same way.
+    #
+    # Cache: measured on task-0033, the first call of each conversation was only 16-26% cached
+    # while every later call was 99%. The prefix is already stable WITHIN a run, so the win is
+    # not there — it is that a new conversation re-sends this whole block as novel tokens, and
+    # there are two conversations per task because the reviewer starts fresh. Hoisting it into
+    # the system message makes it a prefix that is stable ACROSS tasks and later across agents.
+    #
+    # Reading order: the alternative — putting it at the head of the user message — would bury
+    # the actual request under thousands of tokens of notes. In the system message the request
+    # stays the last thing the model reads, which is where it should be.
+    standing = (
+        "\n\n--- YOUR OWN NOTES FROM EARLIER TASKS ---\n"
+        "You wrote these. Nobody else has touched them. They are pasted in because you have no "
+        "memory of writing them.\n"
+        "\n"
+        f"{agent_notes.context_block()}\n"
+        "\n"
+        f"{agent_notes.UPKEEP_NOTE}\n"
+        "\n"
+        "--- DELIVERY ---\n"
+        # Built from the assets file so the suggested app slot accounts for what is already
+        # deployed, and suppressed entirely when there is no token — an agent told to ship
+        # without credentials reports having shipped.
+        f"{agent_delivery.delivery_note(agent_notes.read_assets(), bool(os.environ.get('GITHUB_TOKEN')))}"
+    )
+
+    # THE REQUEST — what actually arrived, plus the two facts that are specific to this task.
     task = (
         f"{subject}\n\n{plain_body(msg).strip()}".strip()
         + "\n\n---\n"
@@ -551,21 +581,7 @@ def handle_message(raw, seq):
         "your reply so it can be opened in a browser. Only ports "
         f"{APP_PORT_BASE}-{APP_PORT_BASE + APP_PORT_COUNT - 1} are reachable from outside your "
         "container. Say plainly that it stays up only while the container does. If the task "
-        "needs no server, ignore all of this.\n"
-        "\n"
-        "--- YOUR OWN NOTES FROM EARLIER TASKS ---\n"
-        "You wrote these. Nobody else has touched them. They are pasted in because you have no "
-        "memory of writing them.\n"
-        "\n"
-        f"{agent_notes.context_block()}\n"
-        "\n"
-        f"{agent_notes.UPKEEP_NOTE}\n"
-        "\n"
-        "--- DELIVERY ---\n"
-        # Built from the assets file so the suggested app slot accounts for what is already
-        # deployed, and suppressed entirely when there is no token — an agent told to ship
-        # without credentials reports having shipped.
-        f"{agent_delivery.delivery_note(agent_notes.read_assets(), bool(os.environ.get('GITHUB_TOKEN')))}"
+        "needs no server, ignore all of this."
     )
     log(f"TASK from {sender}: {subject!r} -> {workspace} (free port {port})")
 
@@ -577,8 +593,9 @@ def handle_message(raw, seq):
     started = time.time()          # anything newer than this in the workspace, the task made
     try:
         result = agent_brain.agent_loop(task, workspace=workspace, tag="worker",
-                                        require_marker=True)
-        result, review = run_review_gate(task, result, workspace)
+                                        require_marker=True,
+                                        system_prompt=agent_brain.SYSTEM_PROMPT + standing)
+        result, review = run_review_gate(task, result, workspace, standing)
     except Exception:
         tb = traceback.format_exc()
         log(f"worker crashed running the task:\n{tb}")
@@ -636,7 +653,7 @@ def handle_message(raw, seq):
             log(f"COULD NOT SEND REVIEW EMAIL:\n{traceback.format_exc()}")
 
 
-def run_review_gate(task, result, workspace):
+def run_review_gate(task, result, workspace, standing=""):
     """Build -> review -> rework, until it passes or we run out of patience.
 
     Returns (final_result, review) where review is {"passed", "notes", "rounds"} — or
@@ -654,7 +671,9 @@ def run_review_gate(task, result, workspace):
     history, review_calls = [], []
     for attempt in range(1, VALIDATION_ROUNDS + 1):
         log(f"review round {attempt}/{VALIDATION_ROUNDS}")
-        verdict = agent_validator.review(task, result, workspace)
+        # The reviewer gets the standing context too — it needs the delivery rules to judge a
+        # delivery claim, and it used to receive them only because they were glued to the task.
+        verdict = agent_validator.review(task, result, workspace, standing=standing)
         history.append({"round": attempt, "passed": verdict["passed"], "notes": verdict["notes"]})
         review_calls.extend(verdict["transcript"])
         # The reviewer's own tool calls belong in the worker's evidence too — it re-ran things,
