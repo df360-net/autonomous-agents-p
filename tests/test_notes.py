@@ -1,6 +1,13 @@
 """The agent's memory files and port allocation. No API calls, no mail server."""
 import os, socket, sys, tempfile
 
+# This file tests the WORKSPACE-LOCAL layout, so external memory has to be off. Without this
+# the tests pass on a laptop with no remote configured and fail inside the container, where
+# path_of() correctly resolves to /memory/tenant and "all three files are missing" is answered
+# by the agent's real 53KB of notes. Same shape as the AGENT_ADDRESS problem in test_identity:
+# a test that reads ambient environment is a test that only checks the machine it ran on.
+for _v in ("MEMORY_TENANT_REMOTE", "MEMORY_FLEET_REMOTE", "MEMORY_ROOT"):
+    os.environ.pop(_v, None)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_notes
 
