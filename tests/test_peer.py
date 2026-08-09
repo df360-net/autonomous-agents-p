@@ -144,6 +144,21 @@ check("an unknown purpose is refused",
 check("an empty body is refused", agent_peer.send(to="agent2", purpose="question",
                                                   subject="s", body="  ").startswith("ERROR"))
 
+# Answering the peer who asked is the harness's job, not the tool's. Seen live: agent2 used
+# the tool AND the harness sent its task reply, so agent1 got two emails and ran two tasks off
+# one question.
+task(from_agent="dev/agent2")
+out = agent_peer.send(to="agent2", purpose="answer", subject="s", body="b")
+check("REFUSED: answering the peer who sent this task — the reply already goes to them",
+      out.startswith("ERROR") and "twice" in out, out)
+check("  ...same for a review result", agent_peer.send(to="agent2", purpose="review-result",
+                                                       subject="s", body="b").startswith("ERROR"))
+check("  ...but writing to them about something NEW is fine",
+      agent_peer.send(to="agent2", purpose="question", subject="s", body="b").startswith("Sent"))
+task(from_agent="dev/agent3")
+check("  ...and answering a DIFFERENT agent is fine",
+      agent_peer.send(to="agent2", purpose="answer", subject="s", body="b").startswith("Sent"))
+
 # Width, not depth: hops cannot see a fan-out inside one task.
 task()
 outs = [agent_peer.send(to="agent2", purpose="question", subject=f"s{i}", body="b")

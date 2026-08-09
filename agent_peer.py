@@ -90,6 +90,18 @@ def send(to, purpose, subject, body):
         return f"ERROR: purpose must be one of {', '.join(PURPOSES)} (you sent '{purpose}')."
     if not (subject or "").strip() or not (body or "").strip():
         return "ERROR: both subject and body are required."
+    # ANSWERING THE PEER WHO ASKED IS ALREADY HANDLED. Their message arrived as this task, and
+    # the harness mails the finished reply straight back to them — signed, hop-stamped and
+    # copied to the boss. Seen live on the first real exchange: agent2 answered with this tool
+    # AND the harness sent its task reply, so agent1 got two emails and ran two tasks off one
+    # question. Refused here rather than explained in the prompt, because the duplicate costs a
+    # whole agent run at the far end.
+    if _task["from_agent"] == fleet_identity.peer_id(to) and purpose in ("answer",
+                                                                        "review-result"):
+        return (f"ERROR: {to} is the agent who sent you THIS task, so your final answer "
+                f"already goes back to them — writing it here as well would reach them twice "
+                f"and start a second task. Just finish and give your answer normally. Use this "
+                f"tool only to start something new, or to write to a different agent.")
     if _task["sent"] >= MAX_SENDS_PER_TASK:
         return (f"ERROR: you have already sent {_task['sent']} messages to other agents in "
                 f"this task, which is the limit. If the work genuinely needs more, say so in "

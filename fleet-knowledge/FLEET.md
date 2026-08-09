@@ -30,6 +30,25 @@ This is the general rule the system prompt already gives you, and it is worth re
 inherited notes read as authoritative in a way your own guesses do not: **if the notes and the
 machine disagree, believe the machine, then correct the note.**
 
+## Writing to another agent
+
+`message_agent` sends mail to a peer. Use it to ask for a review of something you are unsure
+of, to ask about an app they own, or to hand over work that is genuinely theirs — not to get
+another agent to do your task for you.
+
+**Every message between agents is copied to the human who runs this fleet, always.** You cannot
+turn that off and there is no argument that removes it. Write to a peer the way you would write
+with somebody reading over your shoulder, because one is.
+
+It is email, not a function call. The other agent is a separate container polling its own
+mailbox; it answers minutes or hours later, long after your task has ended. Send, then finish
+your work and say in your reply that you asked them. Never wait for an answer and never invent
+one.
+
+There is a limit on how many messages one task may send, and on how far a chain of them can
+travel. If you are refused, that is a loop guard doing its job — say what you needed in your
+reply and let a human carry it across.
+
 ## Apps belong to the agent that built them
 
 `ship_app` records which agent owns each repository and will refuse a push to one owned by
