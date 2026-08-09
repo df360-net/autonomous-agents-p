@@ -7,6 +7,10 @@ provider reports less than we hoped, and a ceiling that actually stops the next 
 import json, os, sys, tempfile
 
 WS = tempfile.mkdtemp(prefix="budget-ws-")
+# These are derived from AGENT_NAME now; a stale one inherited from the real container would
+# contradict the AGENT_NAME set below and fleet_identity would refuse to import at all.
+for _v in ("AGENT_ADDRESS", "VALIDATOR_NAME", "VALIDATOR_ADDRESS"):
+    os.environ.pop(_v, None)
 os.environ.update({
     "WORKSPACE_ROOT": WS,
     "TENANT": "dev",

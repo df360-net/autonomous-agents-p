@@ -31,12 +31,15 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import fleet_identity
+
 # ---- Identity ----------------------------------------------------------------
-# TENANT is a constant today and a real dimension later (see docs/Fleet-Design.md, D1/D2).
-# It is recorded now because ledger history cannot be back-filled with it.
-TENANT = os.environ.get("TENANT", "dev")
-AGENT_NAME = os.environ.get("AGENT_NAME", "agent1")
-AGENT_ID = f"{TENANT}/{AGENT_NAME}"
+# One derivation, in one module. TENANT is a constant today and a real dimension later
+# (docs/Fleet-Design.md D1/D2); it is recorded from the first row because ledger history
+# cannot be back-filled with a tenant column.
+TENANT = fleet_identity.TENANT
+AGENT_NAME = fleet_identity.NAME
+AGENT_ID = fleet_identity.AGENT_ID
 
 # ---- Where the numbers live --------------------------------------------------
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")

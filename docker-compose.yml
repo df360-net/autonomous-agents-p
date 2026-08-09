@@ -78,13 +78,18 @@ services:
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}
       - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
-      - AGENT_NAME=agent1
-      - AGENT_ADDRESS=agent1@agents.local
+      # IDENTITY: two inputs, everything else derived by fleet_identity.py.
+      #   dev + agent1  ->  agent1@agents.local, reviewer validator1@agents.local, id dev/agent1
+      # AGENT_ADDRESS, VALIDATOR_NAME and VALIDATOR_ADDRESS are deliberately NOT set here.
+      # Four independent variables for one identity is how an agent ends up reading one inbox
+      # and signing as another, which nothing downstream can detect. Setting one to a value
+      # that disagrees with the derivation is now a startup error, not an override.
+      - TENANT=${TENANT:-dev}
+      - AGENT_NAME=${AGENT_NAME:-agent1}
+      - AGENT_DOMAIN=${AGENT_DOMAIN:-agents.local}
+      # Not derived: a secret is issued, never computed. The reviewer needs none — it only
+      # ever sends, relayed on :25 by a trusted container, and has no inbox to read.
       - AGENT_PASSWORD=${AGENT1_PASSWORD:?set AGENT1_PASSWORD in .env}
-      # The reviewer only ever sends (relayed on :25 by a trusted container), so it needs an
-      # address but no password — it has no inbox to read.
-      - VALIDATOR_NAME=validator1
-      - VALIDATOR_ADDRESS=validator1@agents.local
       - VALIDATION_ROUNDS=${VALIDATION_ROUNDS:-3}
       - IMAP_HOST=mailserver
       - IMAP_PORT=143

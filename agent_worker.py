@@ -32,6 +32,7 @@ import agent_budget
 import agent_delivery
 import agent_notes
 import agent_validator
+import fleet_identity
 
 # ---- Config -----------------------------------------------------------------
 IMAP_HOST = os.environ.get("IMAP_HOST", "mailserver")
@@ -41,13 +42,16 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "mailserver")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
 SMTP_SSL = os.environ.get("SMTP_SSL", "false").lower() == "true"
 
-AGENT_ADDRESS = os.environ.get("AGENT_ADDRESS", "agent1@agents.local")
-AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "")
-AGENT_NAME = os.environ.get("AGENT_NAME", "agent1")
+# Identity is derived from TENANT and AGENT_NAME in one place — see fleet_identity for why
+# four independent environment variables for one identity was a bug waiting to be typed.
+AGENT_ADDRESS = fleet_identity.AGENT_ADDRESS
+AGENT_NAME = fleet_identity.NAME
 # The reviewer signs off from its own mailbox, so the sign-off visibly is not the worker
 # grading its own homework. It only ever sends — it has no inbox to poll and no password.
-VALIDATOR_ADDRESS = os.environ.get("VALIDATOR_ADDRESS", "validator1@agents.local")
-VALIDATOR_NAME = os.environ.get("VALIDATOR_NAME", "validator1")
+VALIDATOR_ADDRESS = fleet_identity.VALIDATOR_ADDRESS
+VALIDATOR_NAME = fleet_identity.VALIDATOR_NAME
+# Not derived: a secret is issued, never computed.
+AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "")
 # Sending is a separate credential from reading: inside the compose bridge the mail server
 # relays for trusted containers with no auth at all (port 25), so SMTP_USER stays empty.
 SMTP_USER = os.environ.get("SMTP_USER", "")
