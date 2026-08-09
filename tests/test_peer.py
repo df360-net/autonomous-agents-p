@@ -150,11 +150,16 @@ check("an empty body is refused", agent_peer.send(to="agent2", purpose="question
 task(from_agent="dev/agent2")
 out = agent_peer.send(to="agent2", purpose="answer", subject="s", body="b")
 check("REFUSED: answering the peer who sent this task — the reply already goes to them",
-      out.startswith("ERROR") and "twice" in out, out)
+      out.startswith("ERROR") and "TWICE" in out, out)
 check("  ...same for a review result", agent_peer.send(to="agent2", purpose="review-result",
                                                        subject="s", body="b").startswith("ERROR"))
-check("  ...but writing to them about something NEW is fine",
-      agent_peer.send(to="agent2", purpose="question", subject="s", body="b").startswith("Sent"))
+check("  ...and ANY other purpose too — a second message forks the conversation whatever "
+      "it is called",
+      agent_peer.send(to="agent2", purpose="question", subject="s", body="b")
+      .startswith("ERROR"))
+check("  ...and review-request as well",
+      agent_peer.send(to="agent2", purpose="review-request", subject="s", body="b")
+      .startswith("ERROR"))
 task(from_agent="dev/agent3")
 check("  ...and answering a DIFFERENT agent is fine",
       agent_peer.send(to="agent2", purpose="answer", subject="s", body="b").startswith("Sent"))

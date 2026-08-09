@@ -100,12 +100,14 @@ def send(to, purpose, subject, body):
     # AND the harness sent its task reply, so agent1 got two emails and ran two tasks off one
     # question. Refused here rather than explained in the prompt, because the duplicate costs a
     # whole agent run at the far end.
-    if _task["from_agent"] == fleet_identity.peer_id(to) and purpose in ("answer",
-                                                                        "review-result"):
-        return (f"ERROR: {to} is the agent who sent you THIS task, so your final answer "
-                f"already goes back to them — writing it here as well would reach them twice "
-                f"and start a second task. Just finish and give your answer normally. Use this "
-                f"tool only to start something new, or to write to a different agent.")
+    if _task["from_agent"] == fleet_identity.peer_id(to):
+        return (f"ERROR: {to} is the agent who sent you THIS task, so whatever you write here "
+                f"reaches them TWICE — once now and once as your final answer, which the "
+                f"harness mails back to them automatically. They would run it as two separate "
+                f"tasks and the conversation would split in two.\n"
+                f"Put everything you want {to} to receive — your answer, and anything new you "
+                f"want to raise with them — into your final answer instead. Use this tool only "
+                f"to write to an agent who did NOT send you this task.")
     if _task["sent"] >= MAX_SENDS_PER_TASK:
         return (f"ERROR: you have already sent {_task['sent']} messages to other agents in "
                 f"this task, which is the limit. If the work genuinely needs more, say so in "
