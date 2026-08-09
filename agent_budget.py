@@ -44,7 +44,13 @@ AGENT_ID = fleet_identity.AGENT_ID
 # ---- Where the numbers live --------------------------------------------------
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
 LEDGER = os.environ.get("SPEND_LEDGER", os.path.join(WORKSPACE_ROOT, ".spend.jsonl"))
-# Separate path once agents share a volume; the same file while there is one agent.
+# THESE TWO MUST POINT SOMEWHERE EVERY AGENT CAN SEE, or neither of them means what it says.
+# Both default into the agent's OWN workspace, which is right for a single agent and quietly
+# wrong for a fleet: with a per-agent fleet ledger the $500 "fleet" ceiling is really a second
+# per-agent ceiling and true exposure is 500 x N; with a per-agent pause file, the switch that
+# announces "All agents are now paused" pauses exactly one. compose points both at a shared
+# bind mount, and startup_report() says so out loud when they are not — a money control that
+# has silently become per-agent is worse than no control, because the number still looks right.
 FLEET_LEDGER = os.environ.get("FLEET_LEDGER", LEDGER)
 PAUSE_FILE = os.environ.get("FLEET_PAUSE_FILE", os.path.join(WORKSPACE_ROOT, "FLEET-PAUSED"))
 
@@ -239,6 +245,28 @@ def pause(reason):
             fh.write(f"{_now().isoformat(timespec='seconds')}  {AGENT_ID}\n{reason}\n")
     except OSError as e:
         print(f"[budget] COULD NOT WRITE THE PAUSE FILE ({e}) — {reason}", flush=True)
+
+
+def startup_report():
+    """Lines to log once, so a per-agent 'fleet' ceiling cannot hide behind a correct number.
+
+    The failure this exists for has no symptom until the day it matters: everything reports
+    healthy, the ceiling reads $500, and the fleet is actually able to spend $500 per agent
+    while a kill switch that says it stopped everybody stopped one container.
+    """
+    cap = limits()
+    lines = [f"budget: task ${cap['task']:.0f} | {AGENT_ID} daily ${cap['daily']:.0f} | "
+             f"fleet ${cap['fleet']:.0f} | ledger {LEDGER}"]
+    shared = FLEET_LEDGER != LEDGER
+    if shared:
+        lines.append(f"budget: fleet ledger {FLEET_LEDGER}, kill switch {PAUSE_FILE}")
+    else:
+        lines.append(
+            f"WARNING: FLEET_LEDGER is this agent's own ledger, so the ${cap['fleet']:.0f} "
+            f"fleet ceiling only counts {AGENT_ID}. With N agents the fleet can spend N times "
+            f"that, and {PAUSE_FILE} pauses this container alone. Correct for a single agent; "
+            f"set FLEET_LEDGER and FLEET_PAUSE_FILE to a shared path for a fleet.")
+    return lines
 
 
 def check():

@@ -653,7 +653,8 @@ def main():
     # it is visible in `docker logs`, not be swallowed as a bad poll cycle.
     for line in agent_memory.sync(WORKSPACE_ROOT, agent_notes.SCOPES):
         log(line)
-    for line in port_config_report() + agent_principal.startup_report() + [agent_memory.status()]:
+    for line in (port_config_report() + agent_principal.startup_report()
+                 + agent_budget.startup_report() + [agent_memory.status()]):
         log(line)
 
     while True:

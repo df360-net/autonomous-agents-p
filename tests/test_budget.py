@@ -4,7 +4,7 @@ The ledger is the instrument the rest of the fleet plan is calibrated against, s
 under test is mostly "does it tell the truth": the right tokens, an honest price when the
 provider reports less than we hoped, and a ceiling that actually stops the next call.
 """
-import json, os, sys, tempfile
+import json, os, shutil, sys, tempfile
 
 WS = tempfile.mkdtemp(prefix="budget-ws-")
 # These are derived from AGENT_NAME now; a stale one inherited from the real container would
@@ -214,6 +214,90 @@ b.record({"prompt_tokens": 1_000_000, "prompt_cache_miss_tokens": 1_000_000,
           "completion_tokens": 0}, model="m")
 check("the footer reports this task's cost", b.task_summary() == "cost: $0.2700 this task",
       b.task_summary())
+
+# ---- Two agents, one fleet ---------------------------------------------------
+# The regression that made this necessary: FLEET_LEDGER and FLEET_PAUSE_FILE both default
+# into the agent's OWN workspace. Correct for one agent, silently wrong for two — the "fleet"
+# ceiling counts only the agent checking it, and a switch announcing "All agents are now
+# paused" pauses one container. Nothing reports it; the number still reads $500.
+print()
+print("--- the fleet ceiling and kill switch are FLEET-wide ---")
+import importlib
+
+FLEET_DIR = tempfile.mkdtemp(prefix="fleet-")
+FLEET_LEDGER = os.path.join(FLEET_DIR, "spend.jsonl")
+PAUSE = os.path.join(FLEET_DIR, "FLEET-PAUSED")
+
+
+def agent(name, shared=True):
+    """A second agent is a second process-level environment: identity resolves at import."""
+    ws = os.path.join(FLEET_DIR, name)
+    os.makedirs(ws, exist_ok=True)
+    os.environ.update({"WORKSPACE_ROOT": ws, "AGENT_NAME": name,
+                       "FLEET_LEDGER": FLEET_LEDGER, "FLEET_PAUSE_FILE": PAUSE,
+                       "AGENT_DAILY_USD": "3.00", "FLEET_DAILY_USD": "4.00",
+                       # High enough to be out of the way. At the suite's default $1 the TASK
+                       # ceiling trips first and every assertion below passes for the wrong
+                       # reason — which it did, silently, until the kill switch failed to
+                       # appear and gave it away.
+                       "AGENT_TASK_USD": "100.00"})
+    if not shared:                       # the misconfiguration: no shared fleet paths at all
+        os.environ.pop("FLEET_LEDGER", None)
+        os.environ.pop("FLEET_PAUSE_FILE", None)
+    for m in ("agent_budget", "fleet_identity"):
+        sys.modules.pop(m, None)
+    return importlib.import_module("agent_budget")
+
+
+def spend(mod, usd):
+    """usd of pure cache-miss prompt tokens."""
+    mod.record({"prompt_tokens": int(usd / 0.27 * 1_000_000),
+                "prompt_cache_miss_tokens": int(usd / 0.27 * 1_000_000),
+                "completion_tokens": 0}, model="m")
+
+
+a1 = agent("agent-01"); a1.start_task("t1")
+spend(a1, 2.0)
+a2 = agent("agent-02"); a2.start_task("t1")
+check("each agent still has its OWN ledger", a2.LEDGER != a1.LEDGER)
+check("  ...so agent-02's DAILY total does not include agent-01's spend",
+      a2._spent_24h(a2.LEDGER) < 0.01, str(a2._spent_24h(a2.LEDGER)))
+check("BUT THE FLEET TOTAL DOES — otherwise the fleet ceiling is 4 dollars PER AGENT",
+      1.9 < a2._spent_24h(a2.FLEET_LEDGER) < 2.1, str(a2._spent_24h(a2.FLEET_LEDGER)))
+
+# agent-02 spends enough that the pair crosses the $4 fleet ceiling while neither has
+# crossed its own $3 daily one. Only a shared ledger can see this.
+spend(a2, 2.5)
+check("neither agent is over its own daily ceiling", a2._spent_24h(a2.LEDGER) < 3.0)
+try:
+    a2.check()
+    check("REFUSED at the fleet ceiling", False, "it was allowed")
+except a2.BudgetExceeded as e:
+    # Assert WHICH ceiling. "Something refused" is satisfied by the task ceiling, the daily
+    # ceiling, or a typo in the test.
+    check("REFUSED at the fleet ceiling, which only a shared ledger can see",
+          "fleet has spent" in str(e), str(e))
+    check("  ...and the trip wrote the kill switch", os.path.exists(PAUSE))
+
+check("THE OTHER AGENT IS PAUSED TOO — the whole point of a fleet switch", a1.paused())
+try:
+    a1.check()
+    check("  ...and refuses to spend", False, "it kept going")
+except a1.BudgetExceeded:
+    check("  ...and refuses to spend", True)
+
+os.remove(PAUSE)
+check("removing the file resumes everybody", not a1.paused() and not a2.paused())
+
+# The misconfiguration itself has to be visible, because it has no other symptom.
+check("a shared fleet ledger is reported plainly",
+      any("fleet ledger" in l for l in a1.startup_report()), str(a1.startup_report()))
+solo = agent("agent-01", shared=False)
+check("A PER-AGENT FLEET LEDGER WARNS LOUDLY — it looks healthy otherwise",
+      any("WARNING" in l and "fleet ceiling only counts" in l for l in solo.startup_report()),
+      str(solo.startup_report()))
+
+shutil.rmtree(FLEET_DIR, ignore_errors=True)
 
 import shutil; shutil.rmtree(WS, ignore_errors=True)
 print("\n" + ("ALL BUDGET TESTS PASSED" if all_ok else "SOME TESTS FAILED"))

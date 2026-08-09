@@ -50,6 +50,14 @@ x-agent-env: &agent-env
   AGENT_TASK_USD: "${AGENT_TASK_USD:-20}"
   AGENT_DAILY_USD: "${AGENT_DAILY_USD:-150}"
   FLEET_DAILY_USD: "${FLEET_DAILY_USD:-500}"
+  # THE FLEET LEDGER AND KILL SWITCH MUST BE SHARED, or they are per-agent controls wearing
+  # fleet names. Both default into the agent's own /workspace, which is right for one agent
+  # and silently wrong for two: the "fleet" ceiling would count only the agent checking it
+  # (true exposure 500 x N), and a trip that announces "All agents are now paused" would pause
+  # one container. /fleet is a host directory every agent mounts. It also makes the spend
+  # history outlive a workspace volume, which /workspace no longer does.
+  FLEET_LEDGER: "${FLEET_LEDGER:-/fleet/spend.jsonl}"
+  FLEET_PAUSE_FILE: "${FLEET_PAUSE_FILE:-/fleet/FLEET-PAUSED}"
   # Per million tokens. Estimates — the ledger stores raw token counts, so a wrong price
   # is a recomputation rather than lost data.
   PRICE_CACHE_HIT_PER_M: "${PRICE_CACHE_HIT_PER_M:-0.07}"
@@ -192,6 +200,7 @@ services:
     volumes:
       - agent1-workspace:/workspace
       - ./memory-remotes:/remotes
+      - ./fleet-state:/fleet
 
   agent2:
     <<: *agent-base
@@ -214,6 +223,7 @@ services:
       # why standing up an agent is a compose block rather than a training period.
       - agent2-workspace:/workspace
       - ./memory-remotes:/remotes
+      - ./fleet-state:/fleet
 
 volumes:
   agent1-workspace:
