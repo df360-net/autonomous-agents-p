@@ -9,11 +9,14 @@ standard those two are held to. Every decision in phases 1–2 is justified agai
 because the point of this document is not a bigger plan — it is knowing **which decisions are
 cheap now and expensive later**.
 
-*Status: 2026-08-09. **Phase 1 is complete** — D1 (`fleet_identity.py`), D3 (`TaskEnvelope`,
-`agent_inbox.py`, `agent_outbox.py`, `run(envelope)`), D7 (`agent_budget.py`) and D6
-(`agent_principal.py`) are built, tested and running on Zeenie as one agent. Item 5 (notes to
-the front of the prompt) is measured and done. Phase 2 has not started. Everything from D2, D4,
-D5 and D8 onward is still design. It supersedes §14 (Roadmap) of the
+*Status: 2026-08-09. **Phase 1 complete; phase 2 all but done.** Built, tested and running on
+Zeenie as **two agents**: D1 (`fleet_identity.py`), D3 (`TaskEnvelope`, `agent_inbox.py`,
+`agent_outbox.py`, `run(envelope)`), D6 (`agent_principal.py`), D7 (`agent_budget.py`) and D5
+(`agent_memory.py`). The cattle test passed on real hardware — agent1's container and its 821MB
+workspace volume were destroyed and it came back with all 53,029 bytes of memory byte-identical.
+`dev/agent2` then came up from six lines of compose knowing everything agent1 had learned.
+Outstanding in phase 2: item 7 (preview router) and the rename half of item 8, both of which
+touch live deployments. D2 and D8 are still design. It supersedes §14 (Roadmap) of the
 main design doc and corrects two of its assumptions — see §12. Companion documents:
 [Autonomous-Agents-Design.md](Autonomous-Agents-Design.md) (the system as it exists),
 [agent-reminder.md](../agent-reminder.md) (context handoff).*
@@ -469,9 +472,16 @@ requester and cost per task.
    bare repos bind-mounted from the host today, so nothing leaves the laptop; repointing
    `MEMORY_TENANT_REMOTE` at GitHub is a one-line change the agent cannot detect.
 7. `preview.request()` + router + wildcard hostnames; **no agent publishes a host port.**
-8. Kill slot integers; apps addressed `<tenant>/<app>`. *(D4)*
-9. Stand up `dev/agent-02` — an env file, a mailbox, a memory clone. Nothing else. *That is the
-   test that phases 1–2 worked.*
+8. Kill slot integers; apps addressed `<tenant>/<app>`. *(D4)* — **partially done.** The full
+   rename touches live repos, live deployments and the Harness pipelines, so it is still
+   pending. What shipped is the guard that made a second agent safe without it: `agent-<app>`
+   is a fleet-wide name, so two agents asked to build "a todo list" resolve to the same
+   repository and the second silently overwrites the first's running application. `ship_app`
+   now records the owning agent in the repo and refuses a push from anyone else.
+9. ✅ Stand up `dev/agent2` — six lines of compose, one `provision-agent.ps1` run. Nothing
+   else. *That is the test that phases 1–2 worked, and it passed:* agent2 came up with 32,865
+   bytes of agent1's machine knowledge already in its memory, its own empty inventory, a
+   derived identity with zero conflicts, and all eight suites green — having been told nothing.
 10. Cross-review via control-plane relay, with the canary, recorded per reviewer from review one.
 
 **Acceptance — the cattle test, run at N=2:**

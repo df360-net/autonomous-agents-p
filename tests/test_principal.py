@@ -10,6 +10,11 @@ import os, sys, tempfile
 WS = tempfile.mkdtemp(prefix="prin-ws-")
 os.environ.update({"WORKSPACE_ROOT": WS, "STATE_FILE": os.path.join(WS, ".processed.json"),
                    "FLEET_HMAC_SECRET": "test-key-not-a-real-one"})
+# IDENTITY IS PINNED, not inherited. These assertions name agent1's mailbox and id, so
+# without this the suite passes in agent1's container and fails in agent2's — where "a peer
+# called dev/agent2" is the agent running the test, and a self-loop refusal is CORRECT. A unit
+# test that varies with the host is testing the host. See the same fix in test_notes.py.
+os.environ.update({"TENANT": "dev", "AGENT_NAME": "agent1", "AGENT_DOMAIN": "agents.local"})
 for _v in ("AGENT_ADDRESS", "VALIDATOR_NAME", "VALIDATOR_ADDRESS", "ALLOWED_SENDERS"):
     os.environ.pop(_v, None)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))

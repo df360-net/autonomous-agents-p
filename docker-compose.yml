@@ -1,9 +1,105 @@
-# Phase 0: one agent, tasked by email. Three containers on one bridge network.
+# A fleet of developer-agents tasked by email, on one bridge network.
 #
-#   you (browser) -> roundcube -> mailserver <- agent-worker (IMAP poll / SMTP reply)
+#   you (browser) -> roundcube -> mailserver <- agent1, agent2 (IMAP poll / SMTP reply)
+#
+# Each agent reads its own mailbox and clones the SAME tenant memory repo, so a new one
+# starts already knowing what the others learned about this machine. See x-agent-env.
 #
 # LAN-only: no external domain, no DNS, no real TLS. `agents.local` exists only inside
 # this compose network. That is deliberate for the MVP — see README.
+
+# ---- Shared agent definition ------------------------------------------------
+# `x-` keys are extension fields: Compose ignores them, and the services below merge them in
+# with `<<:`. One place to change a ceiling, a price or a guard for the whole fleet.
+x-agent-base: &agent-base
+  build: .
+  depends_on:
+    mailserver:
+      condition: service_healthy
+  restart: unless-stopped
+
+x-agent-env: &agent-env
+  DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}"
+  DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-chat}"
+  # IDENTITY: two inputs, everything else derived by fleet_identity.py.
+  #   dev + agent1  ->  agent1@agents.local, reviewer validator1@agents.local, id dev/agent1
+  # AGENT_ADDRESS, VALIDATOR_NAME and VALIDATOR_ADDRESS are deliberately NOT set here.
+  # Four independent variables for one identity is how an agent ends up reading one inbox
+  # and signing as another, which nothing downstream can detect. Setting one to a value
+  # that disagrees with the derivation is now a startup error, not an override.
+  TENANT: "${TENANT:-dev}"
+  AGENT_DOMAIN: "${AGENT_DOMAIN:-agents.local}"
+  # Not derived: a secret is issued, never computed. The reviewer needs none — it only
+  # ever sends, relayed on :25 by a trusted container, and has no inbox to read.
+  VALIDATION_ROUNDS: "${VALIDATION_ROUNDS:-3}"
+  IMAP_HOST: "mailserver"
+  IMAP_PORT: "143"
+  SMTP_HOST: "mailserver"
+  SMTP_PORT: "25"
+  POLL_SECONDS: "${POLL_SECONDS:-20}"
+  MAX_STEPS: "${MAX_STEPS:-200}"
+  # Spend ceilings, in USD. Measured for scale: a trivial question costs about $0.01 and a
+  # real 130-step build that shipped an app cost $0.50. These sit far above that on purpose
+  # — they exist to stop a runaway loop overnight, not to ration real work.
+  # FLEET must stay above AGENT_DAILY: with one agent both ledgers are the same file, and
+  # the fleet ceiling is the one that pauses everybody.
+  # Changeable at runtime WITHOUT a restart by writing /workspace/budget.json:
+  #   {"task_usd": 40, "daily_usd": 300, "fleet_daily_usd": 1000}
+  # which matters here because `docker restart` keeps the env the container was created
+  # with, so an env-only ceiling cannot be moved without recreating the container.
+  AGENT_TASK_USD: "${AGENT_TASK_USD:-20}"
+  AGENT_DAILY_USD: "${AGENT_DAILY_USD:-150}"
+  FLEET_DAILY_USD: "${FLEET_DAILY_USD:-500}"
+  # Per million tokens. Estimates — the ledger stores raw token counts, so a wrong price
+  # is a recomputation rather than lost data.
+  PRICE_CACHE_HIT_PER_M: "${PRICE_CACHE_HIT_PER_M:-0.07}"
+  PRICE_CACHE_MISS_PER_M: "${PRICE_CACHE_MISS_PER_M:-0.27}"
+  PRICE_OUTPUT_PER_M: "${PRICE_OUTPUT_PER_M:-1.10}"
+  # ADMISSION (agent_principal.py). Who may task this agent, and the two loop guards.
+  # ALLOWED_SENDERS is "*" — anyone who can reach the mail server. That is honest about
+  # today (this mail server accepts unauthenticated relay on :25) and it is why the spend
+  # ceilings above are the real bound. Narrow it to "@agents.local,you@example.com" the
+  # moment this box is reachable by anyone you would not hand the API key to.
+  ALLOWED_SENDERS: "${ALLOWED_SENDERS:-*}"
+  AGENT_MAX_HOPS: "${AGENT_MAX_HOPS:-3}"
+  AGENT_MAX_THREAD_DEPTH: "${AGENT_MAX_THREAD_DEPTH:-20}"
+  # The key that makes agent-to-agent messages believable. UNSET TODAY, deliberately: with
+  # no key, every message claiming to come from an agent is refused, which is the correct
+  # posture for a fleet with no peer traffic yet. Set it (same value on both agents) when
+  # agent2 arrives. One fleet key now; FLEET_HMAC_SECRET_DEV_AGENT2 overrides per agent,
+  # which is the seam the control plane grows into.
+  FLEET_HMAC_SECRET: "${FLEET_HMAC_SECRET:-}"
+  # MEMORY (agent_memory.py, D5). The agent's notes are a git repo outside the container,
+  # which is what makes the container disposable:
+  #   docker compose rm -f -v agent1 && docker compose up -d agent1
+  # comes back knowing everything. /workspace becomes scratch.
+  #   tenant repo  AGENT.md + AGENT-AVOID.md, shared by every agent in the tenant,
+  #                plus agents/<name>/AGENT-ASSETS.md which is private to each
+  #   fleet repo   FLEET.md, read-only — no agent can push it
+  # UNSET DISABLES THE WHOLE THING and notes stay in /workspace exactly as before, which
+  # is the rollback if this misbehaves: comment out one line and recreate the container.
+  MEMORY_TENANT_REMOTE: "${MEMORY_TENANT_REMOTE:-/remotes/dev-knowledge.git}"
+  MEMORY_FLEET_REMOTE: "${MEMORY_FLEET_REMOTE:-/remotes/fleet-knowledge.git}"
+  # Where to tell you the app is. Must be an address YOUR browser can reach — the
+  # container's own hostname is useless to you, so this is Zeenie's LAN IP.
+  APP_HOST: "${APP_HOST:-192.168.0.21}"
+  # Delivery: how the agent ships an app down the real CI/CD pipeline instead of leaving
+  # a dev server running. Needs a PAT with `repo` AND `workflow` scope — without the
+  # latter, GitHub rejects any push touching .github/workflows/ with a misleading error.
+  # Unset = the agent is told delivery is unavailable and must say so rather than pretend.
+  GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+  GITHUB_OWNER: "${GITHUB_OWNER:-df360-net}"
+  K8S_NAMESPACE: "${K8S_NAMESPACE:-agent-apps}"
+  NODE_PORT_BASE: "${NODE_PORT_BASE:-30000}"
+  PROXY_PORT_BASE: "${PROXY_PORT_BASE:-31000}"
+  # Local preview ports: where the agent runs an app while BUILDING it. Bounded by what
+  # this container publishes below — APP_PORT_RANGE must cover BASE..BASE+COUNT-1, and
+  # the worker refuses to start quietly if it does not (Compose cannot do the arithmetic,
+  # so the check lives in agent_worker.main).
+  # Cluster app slots — a DIFFERENT number. A preview costs a published port here; a
+  # cluster slot costs only a NodePort and a listener in agent-app-proxy, so this can be
+  # much larger. Must match the range agent-app-proxy publishes (31000-31019 at 20).
+  APP_SLOT_COUNT: "${APP_SLOT_COUNT:-20}"
 
 services:
   mailserver:
@@ -69,119 +165,59 @@ services:
       - "8080:80"      # http://<zeenie-ip>:8080 — the user's inbox UI
     restart: unless-stopped
 
+  # ---- The fleet -------------------------------------------------------------
+  # Two agents, one shared definition. Everything that is the SAME for every agent lives in
+  # the x-agent-* anchors above; a service below carries only what genuinely differs — its
+  # name, its mailbox password, its preview port range and its scratch volume. Six lines.
+  #
+  # This is not tidiness. The alternative is a copied 80-line block, and a copied block is
+  # where you change three things and miss the fourth — which is precisely the failure
+  # fleet_identity.py exists to prevent one level down. Agent three is six more lines, and
+  # every ceiling, price, guard and remote it inherits is inherited rather than re-typed.
   agent-worker:
-    build: .
+    <<: *agent-base
     container_name: agent1
-    depends_on:
-      mailserver:
-        condition: service_healthy
     environment:
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}
-      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
-      # IDENTITY: two inputs, everything else derived by fleet_identity.py.
-      #   dev + agent1  ->  agent1@agents.local, reviewer validator1@agents.local, id dev/agent1
-      # AGENT_ADDRESS, VALIDATOR_NAME and VALIDATOR_ADDRESS are deliberately NOT set here.
-      # Four independent variables for one identity is how an agent ends up reading one inbox
-      # and signing as another, which nothing downstream can detect. Setting one to a value
-      # that disagrees with the derivation is now a startup error, not an override.
-      - TENANT=${TENANT:-dev}
-      - AGENT_NAME=${AGENT_NAME:-agent1}
-      - AGENT_DOMAIN=${AGENT_DOMAIN:-agents.local}
-      # Not derived: a secret is issued, never computed. The reviewer needs none — it only
-      # ever sends, relayed on :25 by a trusted container, and has no inbox to read.
-      - AGENT_PASSWORD=${AGENT1_PASSWORD:?set AGENT1_PASSWORD in .env}
-      - VALIDATION_ROUNDS=${VALIDATION_ROUNDS:-3}
-      - IMAP_HOST=mailserver
-      - IMAP_PORT=143
-      - SMTP_HOST=mailserver
-      - SMTP_PORT=25
-      - POLL_SECONDS=${POLL_SECONDS:-20}
-      - MAX_STEPS=${MAX_STEPS:-200}
-      # Spend ceilings, in USD. Measured for scale: a trivial question costs about $0.01 and a
-      # real 130-step build that shipped an app cost $0.50. These sit far above that on purpose
-      # — they exist to stop a runaway loop overnight, not to ration real work.
-      # FLEET must stay above AGENT_DAILY: with one agent both ledgers are the same file, and
-      # the fleet ceiling is the one that pauses everybody.
-      # Changeable at runtime WITHOUT a restart by writing /workspace/budget.json:
-      #   {"task_usd": 40, "daily_usd": 300, "fleet_daily_usd": 1000}
-      # which matters here because `docker restart` keeps the env the container was created
-      # with, so an env-only ceiling cannot be moved without recreating the container.
-      - AGENT_TASK_USD=${AGENT_TASK_USD:-20}
-      - AGENT_DAILY_USD=${AGENT_DAILY_USD:-150}
-      - FLEET_DAILY_USD=${FLEET_DAILY_USD:-500}
-      # Per million tokens. Estimates — the ledger stores raw token counts, so a wrong price
-      # is a recomputation rather than lost data.
-      - PRICE_CACHE_HIT_PER_M=${PRICE_CACHE_HIT_PER_M:-0.07}
-      - PRICE_CACHE_MISS_PER_M=${PRICE_CACHE_MISS_PER_M:-0.27}
-      - PRICE_OUTPUT_PER_M=${PRICE_OUTPUT_PER_M:-1.10}
-      # ADMISSION (agent_principal.py). Who may task this agent, and the two loop guards.
-      # ALLOWED_SENDERS is "*" — anyone who can reach the mail server. That is honest about
-      # today (this mail server accepts unauthenticated relay on :25) and it is why the spend
-      # ceilings above are the real bound. Narrow it to "@agents.local,you@example.com" the
-      # moment this box is reachable by anyone you would not hand the API key to.
-      - ALLOWED_SENDERS=${ALLOWED_SENDERS:-*}
-      - AGENT_MAX_HOPS=${AGENT_MAX_HOPS:-3}
-      - AGENT_MAX_THREAD_DEPTH=${AGENT_MAX_THREAD_DEPTH:-20}
-      # The key that makes agent-to-agent messages believable. UNSET TODAY, deliberately: with
-      # no key, every message claiming to come from an agent is refused, which is the correct
-      # posture for a fleet with no peer traffic yet. Set it (same value on both agents) when
-      # agent2 arrives. One fleet key now; FLEET_HMAC_SECRET_DEV_AGENT2 overrides per agent,
-      # which is the seam the control plane grows into.
-      - FLEET_HMAC_SECRET=${FLEET_HMAC_SECRET:-}
-      # MEMORY (agent_memory.py, D5). The agent's notes are a git repo outside the container,
-      # which is what makes the container disposable:
-      #   docker compose rm -f -v agent1 && docker compose up -d agent1
-      # comes back knowing everything. /workspace becomes scratch.
-      #   tenant repo  AGENT.md + AGENT-AVOID.md, shared by every agent in the tenant,
-      #                plus agents/<name>/AGENT-ASSETS.md which is private to each
-      #   fleet repo   FLEET.md, read-only — no agent can push it
-      # UNSET DISABLES THE WHOLE THING and notes stay in /workspace exactly as before, which
-      # is the rollback if this misbehaves: comment out one line and recreate the container.
-      - MEMORY_TENANT_REMOTE=${MEMORY_TENANT_REMOTE:-/remotes/dev-knowledge.git}
-      - MEMORY_FLEET_REMOTE=${MEMORY_FLEET_REMOTE:-/remotes/fleet-knowledge.git}
-      # Where to tell you the app is. Must be an address YOUR browser can reach — the
-      # container's own hostname is useless to you, so this is Zeenie's LAN IP.
-      - APP_HOST=${APP_HOST:-192.168.0.21}
-      # Delivery: how the agent ships an app down the real CI/CD pipeline instead of leaving
-      # a dev server running. Needs a PAT with `repo` AND `workflow` scope — without the
-      # latter, GitHub rejects any push touching .github/workflows/ with a misleading error.
-      # Unset = the agent is told delivery is unavailable and must say so rather than pretend.
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_OWNER=${GITHUB_OWNER:-df360-net}
-      - K8S_NAMESPACE=${K8S_NAMESPACE:-agent-apps}
-      - NODE_PORT_BASE=${NODE_PORT_BASE:-30000}
-      - PROXY_PORT_BASE=${PROXY_PORT_BASE:-31000}
-      # Local preview ports: where the agent runs an app while BUILDING it. Bounded by what
-      # this container publishes below — APP_PORT_RANGE must cover BASE..BASE+COUNT-1, and
-      # the worker refuses to start quietly if it does not (Compose cannot do the arithmetic,
-      # so the check lives in agent_worker.main).
-      - APP_PORT_BASE=${APP_PORT_BASE:-3000}
-      - APP_PORT_COUNT=${APP_PORT_COUNT:-10}
-      - APP_PORT_RANGE=${APP_PORT_RANGE:-3000-3009}
-      # Cluster app slots — a DIFFERENT number. A preview costs a published port here; a
-      # cluster slot costs only a NodePort and a listener in agent-app-proxy, so this can be
-      # much larger. Must match the range agent-app-proxy publishes (31000-31019 at 20).
-      - APP_SLOT_COUNT=${APP_SLOT_COUNT:-20}
+      <<: *agent-env
+      AGENT_NAME: "agent1"
+      AGENT_PASSWORD: "${AGENT1_PASSWORD:?set AGENT1_PASSWORD in .env}"
+      APP_PORT_BASE: "3000"
+      APP_PORT_COUNT: "10"
+      APP_PORT_RANGE: "3000-3009"
     ports:
       # Apps the agent builds live here while it tests them. One port per task, reclaimed when
-      # nothing is listening. Keep in step with APP_PORT_BASE/APP_PORT_COUNT above.
-      - "${APP_PORT_RANGE:-3000-3009}:${APP_PORT_RANGE:-3000-3009}"
+      # nothing is listening. Must match APP_PORT_BASE/APP_PORT_COUNT — the worker warns at
+      # startup if they disagree, because Compose cannot do the arithmetic itself.
+      - "3000-3009:3000-3009"
     volumes:
-      # SCRATCH (D5). Task folders and running apps. Nothing here is precious any more —
-      # the agent's memory moved to /remotes below, so this volume can be deleted and the
-      # agent comes back knowing everything. Inspect it with `docker exec -it agent1 bash`.
       - agent1-workspace:/workspace
-      # THE MEMORY REMOTES, and the only bind mount the agent gets. A host directory rather
-      # than a named volume, deliberately: the point of D5 is that memory outlives every
-      # container, so it should be somewhere you can back up, browse and `git log` from
-      # Windows without docker running at all. Bare repos, created on first start.
-      # Point MEMORY_TENANT_REMOTE at GitHub instead whenever you want it off the laptop —
-      # the agent cannot tell the difference, it is a git remote either way.
       - ./memory-remotes:/remotes
-    restart: unless-stopped
+
+  agent2:
+    <<: *agent-base
+    container_name: agent2
+    environment:
+      <<: *agent-env
+      AGENT_NAME: "agent2"
+      AGENT_PASSWORD: "${AGENT2_PASSWORD:?set AGENT2_PASSWORD in .env}"
+      # A DIFFERENT preview range. Two agents publishing 3000-3009 is not a subtle failure —
+      # the second container simply refuses to start with "port is already allocated".
+      APP_PORT_BASE: "3010"
+      APP_PORT_COUNT: "10"
+      APP_PORT_RANGE: "3010-3019"
+    ports:
+      - "3010-3019:3010-3019"
+    volumes:
+      # Its own scratch. NOT its own memory: it clones the same tenant repo as agent1, so it
+      # starts already knowing what agent1 learned about this machine, and writes its own
+      # inventory to agents/agent2/. That inheritance is the entire point of D5, and it is
+      # why standing up an agent is a compose block rather than a training period.
+      - agent2-workspace:/workspace
+      - ./memory-remotes:/remotes
 
 volumes:
   agent1-workspace:
+  agent2-workspace:
   dms-mail-data:
   dms-mail-state:
   dms-mail-logs:

@@ -23,6 +23,7 @@ in .git/config for the next reader to find.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,12 +32,22 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delivery as d
+import fleet_identity
 
 API = "https://api.github.com"
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 OWNER = d.GITHUB_OWNER
-GIT_NAME = os.environ.get("GIT_AUTHOR_NAME", "agent1")
-GIT_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", "agent1@agents.local")
+# Derived, not hardcoded. These were literal "agent1" strings, which was invisible while there
+# was one agent and becomes wrong authorship on every commit the moment there are two — in the
+# one place it cannot be corrected later, the git history of a shipped app.
+GIT_NAME = os.environ.get("GIT_AUTHOR_NAME", fleet_identity.NAME)
+GIT_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", fleet_identity.AGENT_ADDRESS)
+
+# Written into every repo this tool creates, and checked before pushing into one that already
+# exists. See _check_ownership: `agent-<app>` is a FLEET-WIDE name, so two agents that both
+# build something called "todo" resolve to the same repository.
+OWNER_FILE = ".agent-owner"
+DESCRIPTION = f"Built and maintained by {fleet_identity.AGENT_ID}."
 
 
 def die(msg, code=1):
@@ -123,6 +134,12 @@ def cmd_scaffold(app, directory):
             f.write(d.manifest_example(app, idx))
         print(f"wrote {mf}   <-- EDIT THIS: containerPort, health path, replicas")
 
+    # Stamps the repo with the agent that owns it, so a second agent asked to build something
+    # with the same name is refused at push instead of overwriting a running application. See
+    # _check_ownership. Rewritten every scaffold: it is derived identity, not user content.
+    with open(os.path.join(directory, OWNER_FILE), "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"{fleet_identity.AGENT_ID}\n")
+
     p = d.ports_for(idx)
     print(f"\napp      {d.slug(app)}\nrepo     github.com/{OWNER}/{repo}\n"
           f"image    {d.image_name(app)}\napp slot {idx}\n"
@@ -172,10 +189,60 @@ def _check_app_name(app):
             f"`ship_app push expense-tracker <dir>`.")
 
 
+def _repo_owner(repo, existing):
+    """Which agent owns an existing repo, or None if it cannot be established.
+
+    Two sources, strongest first. `.agent-owner` in the repo is written by this tool and is
+    authoritative. The description is a fallback for the five repos that predate the file —
+    weaker, because a human can edit it, but it is what those repos actually carry.
+    """
+    blob = api(f"/repos/{OWNER}/{repo}/contents/{OWNER_FILE}")
+    if blob and blob.get("content"):
+        import base64
+        try:
+            return base64.b64decode(blob["content"]).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+    desc = (existing or {}).get("description") or ""
+    m = re.search(r"maintained by ([A-Za-z0-9/_-]+)\.?", desc)
+    return m.group(1) if m else None
+
+
+def _check_ownership(repo, existing):
+    """Refuse to push into an app another agent maintains.
+
+    `agent-<app>` is a FLEET-WIDE name — nothing in it says which agent built the thing. With
+    one agent that was invisible. With two, both can be asked to "build a todo list", both
+    resolve to github.com/<owner>/agent-todo, and the second one pushes its own code over the
+    first one's app, then ships it down a pipeline that deploys to the same cluster slot. The
+    first agent's app is simply gone, and its notes still describe it as running.
+
+    D4 fixes this properly by addressing apps as <tenant>/<app>. That is a rename of live
+    repositories and live deployments, so until then this is the guard: names may collide, but
+    the collision stops here rather than at the far end of a deploy pipeline.
+    """
+    owner = _repo_owner(repo, existing)
+    me = fleet_identity.AGENT_ID
+    if owner is None:
+        print(f"note: {repo} has no recorded owner — claiming it for {me}")
+        return
+    # Tolerate the bare name in the five repos that predate tenant-qualified ids.
+    if owner == me or owner == fleet_identity.NAME:
+        return
+    die(f"refusing to push: github.com/{OWNER}/{repo} is maintained by {owner}, not {me}.\n\n"
+        f"  `agent-<app>` is a fleet-wide name, so your app and theirs resolved to the same\n"
+        f"  repository. Pushing would overwrite their application with yours, and the deploy\n"
+        f"  pipeline would then replace the running copy — their notes would still say it is\n"
+        f"  live.\n\n"
+        f"  Pick a distinct app name and push again. If you genuinely need to change THEIR\n"
+        f"  app, that is a request for them, not a push from you: say so in your reply.")
+
+
 def _ensure_repo(repo):
     existing = api(f"/repos/{OWNER}/{repo}")
     if existing:
         print(f"repo github.com/{OWNER}/{repo} already exists")
+        _check_ownership(repo, existing)
         return existing
     # Creating a repo is the one irreversible thing this tool does — the PAT has no
     # delete_repo scope, so a mistake here needs a human with admin. Make it loud rather than
@@ -192,7 +259,7 @@ def _ensure_repo(repo):
     print("=" * 72)
     created = api("/user/repos", "POST", {
         "name": repo,
-        "description": "Built and maintained by agent1.",
+        "description": DESCRIPTION,
         "private": True,
         "has_issues": False, "has_wiki": False, "has_projects": False,
         "auto_init": False,
