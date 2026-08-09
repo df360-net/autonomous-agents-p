@@ -58,6 +58,17 @@ def tls_context():
     return ctx
 
 
+def _one_line(value):
+    """Any header value, collapsed to a single line.
+
+    Belt to agent_inbox's braces. A linefeed in a header value raises when the message is
+    built, which happens AFTER the agent has done the work and spent the money — so the whole
+    reply is lost to a formatting detail. Every value that reaches a header goes through here,
+    because the next one to arrive folded will be one nobody thought about.
+    """
+    return " ".join((value or "").split()) or None
+
+
 def _with_boss(to, cc):
     """The Cc line, with the boss on it. Always.
 
@@ -98,7 +109,7 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     model can reach. BOSS_ADDRESS is added to every message regardless of either.
     """
     reply = EmailMessage()
-    reply["Subject"] = subject
+    reply["Subject"] = _one_line(subject) or "(no subject)"
     reply["From"] = f"{from_name} <{from_addr}>"
     reply["To"] = to
     cc = _with_boss(to, cc)
@@ -108,7 +119,8 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     mid = message_id or email.utils.make_msgid(domain=from_addr.split("@")[-1])
     reply["Message-ID"] = mid
     for key, value in (headers or {}).items():
-        reply[key] = value
+        reply[key] = _one_line(value)
+    in_reply_to, references = _one_line(in_reply_to), _one_line(references)
     if in_reply_to:
         reply["In-Reply-To"] = in_reply_to
         reply["References"] = " ".join(filter(None, [references, in_reply_to]))

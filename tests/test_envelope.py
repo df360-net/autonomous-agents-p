@@ -33,6 +33,10 @@ for _k, _p in (("SPEND_LEDGER", ".spend.jsonl"), ("FLEET_LEDGER", ".spend.jsonl"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_envelope, agent_inbox, agent_outbox
 
+# Kept because a later section replaces send_mail with a stub, and the folded-header
+# regression has to exercise the REAL one — that bug lives in message assembly.
+_REAL_SEND_MAIL = agent_outbox.send_mail
+
 all_ok = True
 
 
@@ -99,6 +103,18 @@ check("a human message has no hops and no purpose",
       e.hops == 0 and e.purpose == "" and e.from_agent is False)
 e6 = agent_inbox.envelope_from_bytes(mail(extra=b"X-Agent-Hops: garbage\r\n"), seq=5)
 check("an unparseable hop count is 0, not a crash", e6.hops == 0, str(e6.hops))
+
+# A long header is FOLDED across lines by the sender's MTA, and msg.get() hands the newlines
+# back. Harmless to read, fatal to re-send. References is the one that grows — a message-id per
+# exchange — so it is safe for the first few and breaks exactly when a conversation gets long,
+# which is when losing the reply costs the most. It broke a ten-round exchange at round two,
+# AFTER the agent had done the work and spent the money.
+folded = agent_inbox.envelope_from_bytes(
+    mail(mid=b"<f@x>", extra=b"References: <a@x>\r\n <b@x>\r\n\t<c@x>\r\n"), seq=6)
+check("A FOLDED References HEADER IS FLATTENED, not carried with its newlines",
+      folded.references == "<a@x> <b@x> <c@x>", repr(folded.references))
+check("  ...and the thread root still reads correctly out of it",
+      folded.thread_id == "<a@x>", folded.thread_id)
 
 
 # ---- The IMAP side, without an IMAP server -----------------------------------
@@ -193,6 +209,38 @@ check("reviewer subject", k["subject"] == "Reviewed: Build a thing", k["subject"
 env2 = agent_inbox.envelope_from_bytes(mail(subject=b"Re: Build a thing"), seq=10)
 agent_outbox.deliver(env2, "x")
 check("Re: is not doubled", sent[-1]["subject"] == "Re: Build a thing", sent[-1]["subject"])
+
+# The crash was on the SEND side, so prove a reply to a deep thread actually goes out.
+print()
+print("--- a reply to a long thread still sends ---")
+CRLF = bytes([13, 10])
+FOLD = bytes([13, 10, 32])          # CRLF + a space: an RFC 5322 folded header
+probe = []
+
+
+class _ProbeSMTP:
+    def __init__(self, *a, **k): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def ehlo(self): pass
+    def has_extn(self, n): return False
+    def login(self, *a): pass
+    def send_message(self, m): probe.append(m)
+
+
+_real_smtp = agent_outbox.smtplib.SMTP
+agent_outbox.smtplib.SMTP = _ProbeSMTP
+agent_outbox.send_mail = _REAL_SEND_MAIL      # undo the stub from the section above
+deep = agent_inbox.envelope_from_bytes(
+    mail(mid=b"<deep@x>", subject=b"Round 7",
+         extra=b"References: " + FOLD.join(b"<r%d@x>" % i for i in range(40)) + CRLF),
+    seq=7)
+agent_outbox.deliver(deep, "my answer")
+check("the reply to a 40-deep thread SENDS instead of raising", len(probe) == 1)
+check("  ...with References on one line",
+      chr(10) not in (probe[0]["References"] or ""), repr(probe[0]["References"])[:80])
+check("  ...and the thread intact", "<r0@x>" in probe[0]["References"])
+agent_outbox.smtplib.SMTP = _real_smtp
 
 import shutil; shutil.rmtree(WS, ignore_errors=True)
 print("\n" + ("ALL ENVELOPE TESTS PASSED" if all_ok else "SOME TESTS FAILED"))

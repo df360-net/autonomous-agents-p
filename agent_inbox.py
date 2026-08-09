@@ -117,6 +117,20 @@ def plain_body(msg):
     return payload(msg)
 
 
+def _one_line(value):
+    """A header value collapsed to a single line.
+
+    RFC 5322 lets a long header be FOLDED across several lines, and `msg.get()` hands the value
+    back with those newlines still in it. That is fine to read and fatal to re-send: setting a
+    header containing a linefeed raises, so the reply is lost after the work is already paid
+    for. It bites on `References`, because that header grows by one message-id per exchange and
+    is short enough to be safe right up until a conversation gets long — which is exactly when
+    losing the reply costs the most. Found mid-way through a ten-round exchange between two
+    agents, in a thread that had been fine for the first four.
+    """
+    return " ".join((value or "").split())
+
+
 def slug(text, limit=40):
     s = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return (s[:limit] or "task").strip("-")
@@ -142,8 +156,8 @@ def envelope_from_bytes(raw, seq):
         hops = int((msg.get(HDR_HOPS) or "0").strip() or 0)
     except ValueError:
         hops = 0
-    references = (msg.get("References") or "").strip()
-    message_id = (msg.get("Message-ID") or "").strip()
+    references = _one_line(msg.get("References"))
+    message_id = _one_line(msg.get("Message-ID"))
     return agent_envelope.TaskEnvelope(
         task_id=task_id_for(seq, subject),
         tenant=fleet_identity.TENANT,
