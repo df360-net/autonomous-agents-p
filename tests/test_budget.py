@@ -32,7 +32,7 @@ def check(label, cond, detail=""):
 
 
 def reset():
-    for p in (b.LEDGER, b.PAUSE_FILE):
+    for p in (b.LEDGER, b.PAUSE_FILE, b.BUDGET_FILE):
         if os.path.exists(p):
             os.remove(p)
     b._recent.update({"path": None, "at": 0.0, "usd": 0.0})
@@ -152,6 +152,34 @@ except b.BudgetExceeded as e:
 os.remove(b.PAUSE_FILE)
 b._recent.update({"path": None, "at": 0.0})
 check("removing the file resumes the fleet", not b.paused())
+
+
+# ---- Ceilings are changeable without a restart -------------------------------
+print("\n--- the runtime override ---")
+reset()
+check("with no file, the configured ceilings apply",
+      b.limits() == {"task": b.TASK_USD, "daily": b.DAILY_USD, "fleet": b.FLEET_DAILY_USD},
+      str(b.limits()))
+
+with open(b.BUDGET_FILE, "w", encoding="utf-8") as fh:
+    json.dump({"task_usd": 9.5, "daily_usd": 40}, fh)
+lim = b.limits()
+check("a value in the file wins", lim["task"] == 9.5 and lim["daily"] == 40.0, str(lim))
+check("an unmentioned ceiling keeps its default", lim["fleet"] == b.FLEET_DAILY_USD, str(lim))
+
+# The raised ceiling must actually take effect mid-flight, with no restart.
+b.record(big, model="m", role="worker")       # $1.08, over the $1.00 configured task cap
+b.check()
+check("a raised ceiling takes effect on the very next call", True)
+
+# Garbage must never be able to REMOVE a ceiling — that is the direction that matters.
+for bad in ('{"task_usd": "lots"}', '{"task_usd": -5}', '{"task_usd": 0}', 'not json at all'):
+    with open(b.BUDGET_FILE, "w", encoding="utf-8") as fh:
+        fh.write(bad)
+    check(f"garbage falls back to the default, not to no limit: {bad[:22]}",
+          b.limits()["task"] == b.TASK_USD, str(b.limits()))
+os.remove(b.BUDGET_FILE)
+check("removing the file restores the configured ceilings", b.limits()["task"] == b.TASK_USD)
 
 
 # ---- Fail open on bookkeeping ------------------------------------------------

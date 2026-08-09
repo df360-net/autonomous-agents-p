@@ -45,10 +45,25 @@ LEDGER = os.environ.get("SPEND_LEDGER", os.path.join(WORKSPACE_ROOT, ".spend.jso
 FLEET_LEDGER = os.environ.get("FLEET_LEDGER", LEDGER)
 PAUSE_FILE = os.environ.get("FLEET_PAUSE_FILE", os.path.join(WORKSPACE_ROOT, "FLEET-PAUSED"))
 
-# ---- Ceilings (loose until measured) -----------------------------------------
-TASK_USD = float(os.environ.get("AGENT_TASK_USD", "5.00"))
-DAILY_USD = float(os.environ.get("AGENT_DAILY_USD", "20.00"))
-FLEET_DAILY_USD = float(os.environ.get("FLEET_DAILY_USD", "50.00"))
+# ---- Ceilings ----------------------------------------------------------------
+# Measured on task-0036: a real build (130 steps, an app designed, tested and shipped) cost
+# $0.4969, and a trivial question about $0.01. These are set far above that on purpose. The
+# goal right now is a capable fleet, not a cheap one, and a ceiling tight enough to interrupt
+# real work would teach us nothing except how to raise it. They still bound the thing they
+# exist for: a loop burning calls overnight trips the fleet switch long before it matters.
+TASK_USD = float(os.environ.get("AGENT_TASK_USD", "20.00"))
+DAILY_USD = float(os.environ.get("AGENT_DAILY_USD", "150.00"))
+# Must stay ABOVE the per-agent daily figure. With one agent the two ledgers are the same file,
+# so a lower fleet ceiling would always trip first — and that one writes a pause file that stops
+# every agent, which is a much bigger hammer than stopping one.
+FLEET_DAILY_USD = float(os.environ.get("FLEET_DAILY_USD", "500.00"))
+
+# Runtime override, so a ceiling can be changed without a rebuild or even a restart. On Zeenie
+# `docker compose up` over SSH is unreliable and `docker restart` keeps the environment the
+# container was created with, which would make an env-only ceiling effectively frozen. A JSON
+# file in the workspace is editable with one `docker exec` and takes effect on the next call.
+BUDGET_FILE = os.environ.get("BUDGET_FILE", os.path.join(WORKSPACE_ROOT, "budget.json"))
+_bad_budget_file = None       # remembered so a broken file is reported once, not 130 times
 
 # ---- Prices, per million tokens ----------------------------------------------
 # Estimates for deepseek-chat, overridable without a code change. Verify against current
@@ -172,6 +187,43 @@ def _spent_24h(path):
     return total
 
 
+def limits():
+    """The three ceilings in force right now.
+
+    Environment sets them at start-up; BUDGET_FILE overrides at runtime. Example:
+
+        {"task_usd": 40, "daily_usd": 300, "fleet_daily_usd": 1000}
+
+    A missing file, a malformed one, or a value that is not a positive number falls back to
+    the configured default rather than to no limit. That direction matters: this is the money
+    path, so a typo must never be able to remove a ceiling — only a deliberate, valid number
+    can move one.
+    """
+    global _bad_budget_file
+    out = {"task": TASK_USD, "daily": DAILY_USD, "fleet": FLEET_DAILY_USD}
+    try:
+        with open(BUDGET_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return out
+    except (OSError, ValueError) as e:
+        if _bad_budget_file != str(e):
+            _bad_budget_file = str(e)
+            print(f"[budget] ignoring {BUDGET_FILE} ({e}) — using the configured ceilings",
+                  flush=True)
+        return out
+    _bad_budget_file = None
+    for key, field in (("task", "task_usd"), ("daily", "daily_usd"), ("fleet", "fleet_daily_usd")):
+        value = (raw or {}).get(field)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[key] = value
+    return out
+
+
 def paused():
     """The fleet kill switch. Checked before any mail is fetched, so a pause consumes nothing
     and the backlog is intact when it is cleared."""
@@ -194,26 +246,27 @@ def check():
             f"the fleet is paused ({PAUSE_FILE} exists). No work is being consumed until it is "
             f"removed."
         )
+    cap = limits()
     with _lock:
         task_usd, task_id = _task["usd"], _task["id"]
-    if task_usd >= TASK_USD:
+    if task_usd >= cap["task"]:
         raise BudgetExceeded(
-            f"this task has spent ${task_usd:.2f}, at its ${TASK_USD:.2f} ceiling "
+            f"this task has spent ${task_usd:.2f}, at its ${cap['task']:.2f} ceiling "
             f"(AGENT_TASK_USD). Work already done is in the workspace."
         )
     day = _spent_24h(LEDGER)
-    if day >= DAILY_USD:
+    if day >= cap["daily"]:
         raise BudgetExceeded(
-            f"{AGENT_ID} has spent ${day:.2f} in the last 24h, at its ${DAILY_USD:.2f} ceiling "
-            f"(AGENT_DAILY_USD)."
+            f"{AGENT_ID} has spent ${day:.2f} in the last 24h, at its ${cap['daily']:.2f} "
+            f"ceiling (AGENT_DAILY_USD)."
         )
     fleet = _spent_24h(FLEET_LEDGER) if FLEET_LEDGER != LEDGER else day
-    if fleet >= FLEET_DAILY_USD:
+    if fleet >= cap["fleet"]:
         # The one ceiling that stops the whole fleet, so it leaves a mark a human must clear.
-        pause(f"fleet spend ${fleet:.2f} reached the ${FLEET_DAILY_USD:.2f} ceiling "
+        pause(f"fleet spend ${fleet:.2f} reached the ${cap['fleet']:.2f} ceiling "
               f"(FLEET_DAILY_USD), tripped by {AGENT_ID} on task {task_id}.")
         raise BudgetExceeded(
-            f"the fleet has spent ${fleet:.2f} in 24h, at its ${FLEET_DAILY_USD:.2f} ceiling. "
+            f"the fleet has spent ${fleet:.2f} in 24h, at its ${cap['fleet']:.2f} ceiling. "
             f"All agents are now paused; remove {PAUSE_FILE} to resume."
         )
 

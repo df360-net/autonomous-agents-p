@@ -92,6 +92,23 @@ services:
       - SMTP_PORT=25
       - POLL_SECONDS=${POLL_SECONDS:-20}
       - MAX_STEPS=${MAX_STEPS:-200}
+      # Spend ceilings, in USD. Measured for scale: a trivial question costs about $0.01 and a
+      # real 130-step build that shipped an app cost $0.50. These sit far above that on purpose
+      # — they exist to stop a runaway loop overnight, not to ration real work.
+      # FLEET must stay above AGENT_DAILY: with one agent both ledgers are the same file, and
+      # the fleet ceiling is the one that pauses everybody.
+      # Changeable at runtime WITHOUT a restart by writing /workspace/budget.json:
+      #   {"task_usd": 40, "daily_usd": 300, "fleet_daily_usd": 1000}
+      # which matters here because `docker restart` keeps the env the container was created
+      # with, so an env-only ceiling cannot be moved without recreating the container.
+      - AGENT_TASK_USD=${AGENT_TASK_USD:-20}
+      - AGENT_DAILY_USD=${AGENT_DAILY_USD:-150}
+      - FLEET_DAILY_USD=${FLEET_DAILY_USD:-500}
+      # Per million tokens. Estimates — the ledger stores raw token counts, so a wrong price
+      # is a recomputation rather than lost data.
+      - PRICE_CACHE_HIT_PER_M=${PRICE_CACHE_HIT_PER_M:-0.07}
+      - PRICE_CACHE_MISS_PER_M=${PRICE_CACHE_MISS_PER_M:-0.27}
+      - PRICE_OUTPUT_PER_M=${PRICE_OUTPUT_PER_M:-1.10}
       # Where to tell you the app is. Must be an address YOUR browser can reach — the
       # container's own hostname is useless to you, so this is Zeenie's LAN IP.
       - APP_HOST=${APP_HOST:-192.168.0.21}
