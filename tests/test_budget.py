@@ -23,6 +23,20 @@ os.environ.update({
     "PRICE_OUTPUT_PER_M": "1.10",
     "BUDGET_RECENT_TTL": "0",          # never memoise, so ceilings are exact under test
 })
+_SANDBOX = WS
+# NO TEST MAY TOUCH REAL FLEET STATE. The container sets FLEET_LEDGER and FLEET_PAUSE_FILE to
+# a shared host directory, and a test that only overrides WORKSPACE_ROOT inherits them — so
+# running this suite inside a container wrote a $4-ceiling trip into the production ledger and
+# left FLEET-PAUSED behind, halting both live agents. The cascade was worse than the pause: the
+# next suite's failures pointed at mail parsing, because agent_inbox.fetch() checks paused()
+# and quietly returned nothing. Redirected, not popped, so a future default cannot leak either.
+# FLEET_LEDGER points at the SAME file as SPEND_LEDGER, which is the module's own default
+# (one agent => one ledger). The sandbox relocates the defaults; it must not invent different
+# ones, or a suite written against single-agent semantics starts tripping a fleet ceiling that
+# would never have fired in the configuration it is testing.
+for _k, _p in (("SPEND_LEDGER", ".spend.jsonl"), ("FLEET_LEDGER", ".spend.jsonl"),
+               ("FLEET_PAUSE_FILE", "FLEET-PAUSED"), ("BUDGET_FILE", "budget.json")):
+    os.environ[_k] = os.path.join(_SANDBOX, _p)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_budget as b
 
@@ -234,6 +248,12 @@ def agent(name, shared=True):
     ws = os.path.join(FLEET_DIR, name)
     os.makedirs(ws, exist_ok=True)
     os.environ.update({"WORKSPACE_ROOT": ws, "AGENT_NAME": name,
+                       # Its OWN ledger and budget file, as a real container would have. The
+                       # sandbox at the top of this file pins SPEND_LEDGER to one path, so
+                       # without this both "agents" would share the per-agent ledger and the
+                       # separation being tested would not exist.
+                       "SPEND_LEDGER": os.path.join(ws, ".spend.jsonl"),
+                       "BUDGET_FILE": os.path.join(ws, "budget.json"),
                        "FLEET_LEDGER": FLEET_LEDGER, "FLEET_PAUSE_FILE": PAUSE,
                        "AGENT_DAILY_USD": "3.00", "FLEET_DAILY_USD": "4.00",
                        # High enough to be out of the way. At the suite's default $1 the TASK

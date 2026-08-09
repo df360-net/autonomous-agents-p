@@ -10,6 +10,21 @@ No API calls and no mail server: call_llm and smtplib are both stubbed.
 import os, sys, types, email
 
 os.environ.update({"WORKSPACE_ROOT": os.path.join(os.path.dirname(__file__), "ws3")})
+import tempfile as _tf
+_SANDBOX = _tf.mkdtemp(prefix='sandbox-')
+# NO TEST MAY TOUCH REAL FLEET STATE. The container sets FLEET_LEDGER and FLEET_PAUSE_FILE to
+# a shared host directory, and a test that only overrides WORKSPACE_ROOT inherits them — so
+# running this suite inside a container wrote a $4-ceiling trip into the production ledger and
+# left FLEET-PAUSED behind, halting both live agents. The cascade was worse than the pause: the
+# next suite's failures pointed at mail parsing, because agent_inbox.fetch() checks paused()
+# and quietly returned nothing. Redirected, not popped, so a future default cannot leak either.
+# FLEET_LEDGER points at the SAME file as SPEND_LEDGER, which is the module's own default
+# (one agent => one ledger). The sandbox relocates the defaults; it must not invent different
+# ones, or a suite written against single-agent semantics starts tripping a fleet ceiling that
+# would never have fired in the configuration it is testing.
+for _k, _p in (("SPEND_LEDGER", ".spend.jsonl"), ("FLEET_LEDGER", ".spend.jsonl"),
+               ("FLEET_PAUSE_FILE", "FLEET-PAUSED"), ("BUDGET_FILE", "budget.json")):
+    os.environ[_k] = os.path.join(_SANDBOX, _p)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_brain, agent_outbox, agent_validator, agent_worker
 
