@@ -17,10 +17,12 @@ reach. Same for the signature: an agent that could sign its own `from` field cou
 any agent in the tenant.
 
 THE BOSS IS ALWAYS COPIED, AND NOT BY ASKING NICELY. Jianmin's requirement, and the reason it
-is three lines of Python rather than a sentence in the prompt: a prompt instruction is followed
-until the one time it isn't, and the failure mode is silent — two agents talking for an hour
-with nobody watching. `send()` appends the address itself, after the agent's arguments have
-been parsed and thrown away. There is no argument that removes it.
+is Python rather than a sentence in the prompt: a prompt instruction is followed until the one
+time it isn't, and the failure mode is silent — two agents talking for an hour with nobody
+watching. It is enforced one level down, in `agent_outbox.send_mail`, which EVERY outbound
+message passes through: task replies and reviewer sign-offs are copied too, not only
+agent-to-agent mail. Putting it at each call site would mean the next call site somebody adds
+is quietly the one that is not copied.
 
 WHY A PER-TASK SEND CAP. Hops bound the length of a CHAIN; they say nothing about width. One
 agent in a loop can send its peer fifty messages inside a single task, each with hops=1 and
@@ -34,9 +36,11 @@ import agent_outbox
 import agent_principal
 import fleet_identity
 
-# Copied on every message between agents, without exception. Configurable because the address
-# differs per deployment; not optional, because the point is oversight.
-BOSS_ADDRESS = os.environ.get("BOSS_ADDRESS", "boss@agents.local").strip()
+# Defined in agent_outbox, which puts it on EVERY email the fleet sends — task replies and
+# reviewer sign-offs included, not only agent-to-agent. Referenced here for the messages this
+# module writes about it; a second os.environ.get would be a second source of truth for one
+# address, and the two would disagree the first time only one of them was changed.
+BOSS_ADDRESS = agent_outbox.BOSS_ADDRESS
 
 # Width limit, complementing the hop limit's depth. See the module docstring.
 MAX_SENDS_PER_TASK = int(os.environ.get("AGENT_MAX_PEER_SENDS", "5"))
@@ -121,9 +125,6 @@ def send(to, purpose, subject, body):
     try:
         agent_outbox.send_mail(
             to=fleet_identity.address(to),
-            # The boss sees every word that passes between agents. Appended here, after the
-            # agent's arguments are parsed, so no argument can remove it.
-            cc=BOSS_ADDRESS,
             subject=f"[{purpose}] {subject}",
             body=_wrap(body, to, purpose),
             from_name=fleet_identity.NAME, from_addr=fleet_identity.AGENT_ADDRESS,

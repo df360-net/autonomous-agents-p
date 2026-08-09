@@ -6,6 +6,11 @@ message; this module knows how to send one.
 
 `send_mail` stays a public primitive because a SECOND identity uses it: the reviewer signs off
 from its own mailbox, so the sign-off visibly is not the worker grading its own homework.
+
+EVERY message this fleet sends copies BOSS_ADDRESS. The rule is enforced here, in the one
+function all of them pass through, rather than at the three call sites that exist today —
+because the fourth one somebody adds would be the one that silently isn't copied, and nobody
+would notice until they went looking for a conversation that was never in their inbox.
 """
 
 import email.utils
@@ -14,6 +19,7 @@ import os
 import smtplib
 import ssl
 from email.message import EmailMessage
+from email.utils import parseaddr
 
 import fleet_identity
 
@@ -32,6 +38,12 @@ AGENT_ADDRESS = fleet_identity.AGENT_ADDRESS
 VALIDATOR_NAME = fleet_identity.VALIDATOR_NAME
 VALIDATOR_ADDRESS = fleet_identity.VALIDATOR_ADDRESS
 
+# COPIED ON EVERY EMAIL THIS FLEET SENDS. Not just agent-to-agent: task replies, reviewer
+# sign-offs, everything. It lives HERE, at the one function every outbound message passes
+# through, rather than at each call site — a call site can be forgotten, and the next one
+# added would silently not be copied. There is no argument that disables it.
+BOSS_ADDRESS = os.environ.get("BOSS_ADDRESS", "boss@agents.local").strip()
+
 
 def log(msg):
     print(f"[outbox] {msg}", flush=True)
@@ -44,6 +56,23 @@ def tls_context():
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def _with_boss(to, cc):
+    """The Cc line, with the boss on it. Always.
+
+    Skipped only when he is already a recipient, because two copies of the same message in one
+    inbox is worse oversight than one — the duplicate teaches you to skim. Matching is on the
+    bare address so `Boss <boss@agents.local>` and `boss@agents.local` count as the same
+    person, which is exactly how they arrive from different senders.
+    """
+    if not BOSS_ADDRESS:
+        return cc
+    already = {parseaddr(a)[1].lower() or a.strip().lower()
+               for a in (to or "").split(",") + (cc or "").split(",") if a.strip()}
+    if parseaddr(BOSS_ADDRESS)[1].lower() in already:
+        return cc
+    return f"{cc}, {BOSS_ADDRESS}" if cc else BOSS_ADDRESS
 
 
 def new_message_id(from_addr=None):
@@ -64,14 +93,15 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     The Message-ID comes back so the reviewer's note can be threaded underneath the worker's
     reply rather than floating loose in the inbox.
 
-    `cc` and `headers` exist for agent-to-agent mail: the boss is copied on every message
-    between agents, and the attestation headers ride along. Both are set by agent_peer, never
-    by anything the model can reach.
+    `cc` and `headers` exist for agent-to-agent mail: the attestation headers ride along, and
+    a caller may add further recipients. Both are set by agent_peer, never by anything the
+    model can reach. BOSS_ADDRESS is added to every message regardless of either.
     """
     reply = EmailMessage()
     reply["Subject"] = subject
     reply["From"] = f"{from_name} <{from_addr}>"
     reply["To"] = to
+    cc = _with_boss(to, cc)
     if cc:
         reply["Cc"] = cc
     reply["Date"] = email.utils.formatdate(localtime=True)

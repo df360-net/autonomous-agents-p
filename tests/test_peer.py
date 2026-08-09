@@ -172,6 +172,38 @@ check("a new task gets a fresh allowance",
       agent_peer.send(to="agent2", purpose="question", subject="s", body="b").startswith("Sent"))
 
 
+# ---- EVERY email, not just the agent-to-agent ones ---------------------------
+print()
+print("--- the boss is copied on everything the fleet sends ---")
+e, _ = task()
+# A requester who is NOT the boss — otherwise the dedupe below correctly suppresses the Cc and
+# these two checks pass without testing anything. The fixture's default requester is the boss.
+outsider = replace(e, reply_to="someone@example.com", requester="Someone <someone@example.com>")
+agent_outbox.deliver(outsider, "here is your answer")
+check("a TASK REPLY to a human copies the boss", sent[-1]["Cc"] == "boss@agents.local",
+      str(sent[-1].get("Cc")))
+agent_outbox.deliver_review(outsider, "looks right", under="<r@x>")
+check("the REVIEWER'S sign-off copies the boss too", sent[-1]["Cc"] == "boss@agents.local",
+      str(sent[-1].get("Cc")))
+check("  ...and it is genuinely from the reviewer, not the worker",
+      "validator1@agents.local" in sent[-1]["From"], sent[-1]["From"])
+
+# Addressed TO him already: one copy, not two. A duplicate in the inbox teaches you to skim.
+boss_env = replace(e, reply_to="boss@agents.local", requester="Boss <boss@agents.local>")
+agent_outbox.deliver(boss_env, "answer")
+check("NO DUPLICATE when the boss is the recipient", sent[-1]["Cc"] is None,
+      str(sent[-1].get("Cc")))
+boss_env = replace(e, reply_to="Boss <boss@agents.local>")
+agent_outbox.deliver(boss_env, "answer")
+check("  ...matched on the address, not the display name", sent[-1]["Cc"] is None,
+      str(sent[-1].get("Cc")))
+# A caller's own Cc is kept, and the boss is added to it.
+agent_outbox.send_mail(to="a@x.com", cc="b@x.com", subject="s", body="b",
+                       from_name="agent1", from_addr="agent1@agents.local")
+check("an existing Cc is kept AND the boss added",
+      sent[-1]["Cc"] == "b@x.com, boss@agents.local", sent[-1]["Cc"])
+
+
 # ---- The round trip ----------------------------------------------------------
 print("\n--- what we send, the other agent accepts ---")
 task()
