@@ -267,6 +267,53 @@ check("ROUND TRIP: signed here, parsed off the wire — refused, because we sign
 check("  ...and the reason is the self-loop, meaning the signature itself VERIFIED",
       "ourselves" in d.reason, d.reason)
 
+# ---- Telling the agent the room is closing -----------------------------------
+# The count is a NOTICE, not a control, so what is tested is that it never promises a message
+# the sender would refuse — a warning that says "one left" when there are none is worse than no
+# warning, because the agent writes a continuation instead of a conclusion.
+print("\n--- the wind-down notice ---")
+_saved_hops = agent_principal.MAX_HOPS
+agent_principal.MAX_HOPS = 20
+
+check("a human task gets no notice at all — there is no conversation to run out",
+      agent_principal.conversation_note(0, "") == "")
+check("ten rounds means nineteen further messages from a standing start",
+      agent_principal.exchanges_left(0) == 19, agent_principal.exchanges_left(0))
+
+# The property that matters: exchanges_left agrees with what outbound_headers will actually do,
+# at every hop. Checked by asking both, rather than by asserting a number twice.
+for _h in range(0, agent_principal.MAX_HOPS + 3):
+    _left = agent_principal.exchanges_left(_h)
+    try:
+        agent_principal.outbound_headers(PEER, "<w@x>", "<t@x>", "answer", inbound_hops=_h)
+        _sendable = True
+    except ValueError:
+        _sendable = False
+    # Parenthesised deliberately: `_left > 0 != _sendable` is a CHAINED comparison in Python,
+    # which reads as `_left > 0 and 0 != _sendable` and quietly never fires.
+    if (_left > 0) != _sendable:
+        check(f"  notice and sender disagree at hop {_h}", False,
+              f"left={_left} sendable={_sendable}")
+        break
+else:
+    check("the notice never promises a message the sender would refuse, at any hop", True)
+
+_mid = agent_principal.conversation_note(4, "dev/agent2")
+check("mid-conversation it states the budget without nagging",
+      "15 messages remain" in _mid and "Start closing" not in _mid, _mid)
+_near = agent_principal.conversation_note(17, "dev/agent2")
+check("near the end it says to start closing", "Start closing" in _near, _near)
+check("  ...and counts the message being written now, not the ones after it",
+      "2 message(s) remain" in _near, _near)
+_over = agent_principal.conversation_note(19, "dev/agent2")
+check("at the limit it says the peer will refuse this reply, so write it for the human",
+      "THIS CONVERSATION IS OVER" in _over and "refuse it" in _over, _over)
+check("  ...and the sender agrees there is nothing left to send",
+      agent_principal.exchanges_left(19) == 0)
+check("past the limit it does not go negative",
+      agent_principal.exchanges_left(99) == 0, agent_principal.exchanges_left(99))
+agent_principal.MAX_HOPS = _saved_hops
+
 import shutil; shutil.rmtree(WS, ignore_errors=True)
 print("\n" + ("ALL PRINCIPAL TESTS PASSED" if all_ok else "SOME TESTS FAILED"))
 sys.exit(0 if all_ok else 1)

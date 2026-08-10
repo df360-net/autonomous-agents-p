@@ -69,7 +69,7 @@ x-agent-env: &agent-env
   # ceilings above are the real bound. Narrow it to "@agents.local,you@example.com" the
   # moment this box is reachable by anyone you would not hand the API key to.
   ALLOWED_SENDERS: "${ALLOWED_SENDERS:-*}"
-  AGENT_MAX_HOPS: "${AGENT_MAX_HOPS:-100}"
+  AGENT_MAX_HOPS: "${AGENT_MAX_HOPS:-20}"    # one hop = one message, so 20 is ten rounds
   AGENT_MAX_THREAD_DEPTH: "${AGENT_MAX_THREAD_DEPTH:-20}"   # humans only; see agent_principal
   # The key that makes agent-to-agent messages believable. UNSET TODAY, deliberately: with
   # no key, every message claiming to come from an agent is refused, which is the correct

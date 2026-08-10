@@ -312,6 +312,56 @@ def outbound_headers(to_agent_id, message_id, thread_id, purpose, inbound_hops=0
     }
 
 
+def exchanges_left(inbound_hops):
+    """How many more agent-to-agent messages this conversation has left, counting the one this
+    agent is about to write. Zero means it cannot send at all.
+
+    Mirrors `outbound_headers` exactly — it refuses at `inbound_hops + 1 >= MAX_HOPS`, so the
+    last sendable hop is MAX_HOPS - 1. Derived here rather than recomputed at the call site
+    because two subtly different arithmetics for one limit is how a warning ends up promising
+    one more round than the sender will actually allow.
+    """
+    return max(0, MAX_HOPS - 1 - int(inbound_hops or 0))
+
+
+def conversation_note(inbound_hops, peer_id):
+    """What the agent is told about how much conversation is left. Empty for human tasks.
+
+    WHY THE AGENT IS TOLD AT ALL, when it cannot change the number: without it the exchange does
+    not end, it stops. The maths competition ran past its own declared finish because each agent
+    kept answering a message that deserved an answer, and nothing in the prompt ever said the
+    room was closing. A limit the agent cannot see is a cliff; a limit it can see is a deadline,
+    and a deadline produces a closing paragraph instead of a severed thread.
+
+    It stays a NOTICE, never a control. The count comes from the inbound envelope, which the
+    model cannot reach, and saying it out loud does not make it settable — an agent that reads
+    "two left" and asks for more gets the same refusal as one that never read it.
+    """
+    if not peer_id:
+        return ""
+    left = exchanges_left(inbound_hops)
+    head = (f"\n--- HOW MUCH OF THIS CONVERSATION IS LEFT ---\n"
+            f"You and {peer_id} have exchanged {int(inbound_hops or 0)} messages in this thread. "
+            f"The harness allows {MAX_HOPS} and you cannot change that — the count rides on the "
+            f"envelope, not on anything you write.\n")
+    if left <= 0:
+        return head + (
+            f"THIS CONVERSATION IS OVER. Your reply will reach the human, but {peer_id} will "
+            f"refuse it — an agent at the hop limit cannot sign, and an unsigned message from a "
+            f"fleet mailbox is dropped by design. So write this one for the human: what was "
+            f"settled, what is still open, and what you would do next if it continued.")
+    if left <= 3:
+        return head + (
+            f"{left} message(s) remain, INCLUDING the one you are about to write. Start closing. "
+            f"Say what you have settled and what is still unresolved, rather than opening a new "
+            f"line of argument you will not get to finish. If the work genuinely needs more than "
+            f"this, say so plainly in your reply and let a human decide — do not try to squeeze "
+            f"it into fewer, longer messages.")
+    return head + (
+        f"{left} messages remain, including the one you are about to write. Enough to finish "
+        f"properly, not enough to drift. A round trip costs two.")
+
+
 def startup_report():
     """Lines worth logging once, so the posture is visible without reading the code."""
     keyed = bool(secret_for(fleet_identity.AGENT_ID))

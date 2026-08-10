@@ -514,6 +514,11 @@ def run(envelope):
         f"{APP_PORT_BASE}-{APP_PORT_BASE + APP_PORT_COUNT - 1} are reachable from outside your "
         "container. Say plainly that it stays up only while the container does. If the task "
         "needs no server, ignore all of this."
+        # Only ever non-empty when a peer sent this task. Last in the block because it is the
+        # one machine fact that changes what the agent should WRITE rather than where it should
+        # work, and the closing instruction is the one worth reading nearest the end.
+        + agent_principal.conversation_note(
+            envelope.hops, principal.principal_id if principal.kind == "agent" else "")
     )
     log(f"TASK from {principal}: {subject!r} -> {workspace} (free port {port})")
 
