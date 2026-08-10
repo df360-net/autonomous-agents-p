@@ -261,10 +261,31 @@ forwarding rule, a mailing list, an out-of-office responder — because `Referen
 every pass and never shrinks. A hop counter alone would not have seen those.
 
 `secret_for(agent_id)` is the seam: one fleet-wide HMAC key today, per-agent keys from the control
-plane next, `TokenReview` or SPIFFE after that, with no call site changing. With **no key
-configured — today's state — all agent-to-agent traffic is refused**, which is the correct posture
-for a fleet that has no peer traffic yet. Replay is handled where it already was, by the
-Message-ID dedupe in `agent_inbox`.
+plane next, `TokenReview` or SPIFFE after that, with no call site changing. Replay is handled where
+it already was, by the Message-ID dedupe in `agent_inbox`.
+
+**The sending half is `agent_peer.py`,** and the split it enforces is the whole design:
+
+| the agent chooses | the harness decides |
+|---|---|
+| who to write to, why (a purpose from a fixed table), what to say | hop count, signature, thread, **the CC to the operator** |
+
+`hops` is read from the INBOUND envelope, which the model never sees and cannot reach from a tool
+argument. The operator CC is enforced one level lower still, in `agent_outbox.send_mail`, so it
+covers *every* message the fleet sends — task replies and reviewer sign-offs included, not just
+peer mail. Neither is a parameter of the tool, so there is nothing to validate and nothing to
+forge; the tests pass each and get `TypeError`.
+
+Two guards that hops alone cannot provide. A **per-task send cap**, because hops bound a chain's
+depth and say nothing about its width — one confused run can send a peer fifty valid hop-1
+messages. And a refusal to write to **the agent who sent the current task**, whatever the purpose:
+their message *arrived as* this task, so the finished answer already goes back to them, and a
+second message forks the conversation into two tasks per leg. That one was found live, doubling a
+ten-round exchange.
+
+*Measured on a real ten-round exchange:* the hop limit had to go from 3 to 100, because 3 was
+chosen as a loop guard and was being asked to serve as a conversation-length policy. The spend
+ceilings are the actual bound and were untouched.
 
 Agent-to-agent messages are **relayed and attested by the control plane**, not sent peer-to-peer.
 That puts authentication, the audit log and hop enforcement in one place.
@@ -483,6 +504,10 @@ requester and cost per task.
    bytes of agent1's machine knowledge already in its memory, its own empty inventory, a
    derived identity with zero conflicts, and all eight suites green — having been told nothing.
 10. Cross-review via control-plane relay, with the canary, recorded per reviewer from review one.
+    **Partially done:** agents can now ask each other for a review over signed mail
+    (`agent_peer.py`), which is the capability. What is missing is the *assurance* half — the
+    canary rate, the reviewer-agreement rate and the per-reviewer record. Those need somewhere to
+    write them, which is the control plane.
 
 **Acceptance — the cattle test, run at N=2:**
 `docker compose rm -f -v agent-02 && docker compose up agent-02` and it returns with all its
