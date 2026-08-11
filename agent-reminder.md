@@ -108,18 +108,30 @@ result + what it built + how it tested it.
 - **A second runtime box exists**: `ssh murphy` → `192.168.0.104`, `LAPTOP-MURPHY`, Win11,
   user `jianm`, same key, admin over SSH. Blank — nothing of ours runs there yet. It is the
   box to reach for when the fleet should span two machines. Same cmd.exe caveat as Zeenie.
-  Its Wi-Fi profile is already pinned Private and its OpenSSH firewall rule set to all
-  profiles, so it survives the reboot failure described below. ZEENIE IS NOT PINNED.
 - Rest of the LAN, all static: elitebook .100 (Ubuntu 26.04, user `jay`), hp-tiger .102/.101,
   lenovo .103.
 - **Remote default shell over SSH is cmd.exe**, NOT bash. Chain with `&` / `&&`; no `head`, `;`,
   or unix pipes. For anything richer: `ssh zeenie 'powershell -NoProfile -Command "..."'`.
-- Docker Desktop **v29.5.3**. **After a Windows reboot on Zeenie, SSH breaks two ways:** (1) Wi-Fi
-  profile resets to **Public** → firewall silently drops port 22 (ssh *timeout*, not *refused*;
-  ping failing is normal — Windows blocks ICMP by default, NOT evidence the host is down). Fix
-  (admin PowerShell on Zeenie): `Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory
-  Private`. (2) **Docker Desktop does not auto-start** — the user must click its icon; until then
-  `docker` over SSH fails with `cannot find ... dockerDesktopLinuxEngine`.
+- **SSH survives the profile flip now, on BOTH boxes.** The failure was never the profile as
+  such — it is that the OpenSSH inbound rule was scoped to Private only, so a Windows Update
+  flipping Wi-Fi to Public silently dropped port 22. Hardened at the rule instead of the
+  profile, because a profile can be flipped back and a rule cannot be flipped by an update:
+  `Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -Profile Any -Enabled True`. sshd is
+  Running/Automatic on both. The old recovery command
+  (`Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private`) still works
+  and is worth remembering as a manual fallback, but should no longer be needed.
+  Do NOT read a timeout as "the box is down": ping failing is normal, Windows blocks ICMP.
+- Docker Desktop **v29.5.3**, and **it does not auto-start** — until someone clicks it,
+  `docker` over SSH fails with `cannot find ... dockerDesktopLinuxEngine`. It has also been
+  seen to STOP on its own with the machine up throughout (07:01 fine → 19:45 gone, uptime
+  unbroken), so "the box rebooted" is not the only cause to check.
+  THE HAZARD IS THAT THIS IS SILENT: with the engine gone the agents are not down, they are
+  absent — mail simply queues in Dovecot, nothing alerts, and no agent can report its own
+  absence. Any watchdog must therefore (a) run IN the interactive user session, not as a
+  SYSTEM service, because Docker Desktop needs the desktop/credential context — the same root
+  cause as `docker pull` failing over SSH, and the same scheduled-task-in-session trick the
+  deploy already uses; and (b) alert on the ENGINE PIPE being reachable, never on agent
+  liveness. Not built yet; infra has offered to help stand it up.
 - Zeenie already runs a **Kind cluster `learn`** (`kindest/node`, k8s API on 6443) — this is
   **Kubernetes, not OpenShift** (the user calls them "OCP containers" but drive with `kubectl`,
   not `oc`). This Kind cluster is where the fleet eventually graduates (step 2). It also has a
