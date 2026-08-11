@@ -40,7 +40,7 @@ import re
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "df360-net")
 REGISTRY = os.environ.get("REGISTRY", "ghcr.io")
 K8S_NAMESPACE = os.environ.get("K8S_NAMESPACE", "agent-apps")
-APP_HOST = os.environ.get("APP_HOST", "192.168.0.21")
+APP_HOST = os.environ.get("APP_HOST", "192.168.0.105")
 
 NODE_PORT_BASE = int(os.environ.get("NODE_PORT_BASE", "30000"))
 PROXY_PORT_BASE = int(os.environ.get("PROXY_PORT_BASE", "31000"))

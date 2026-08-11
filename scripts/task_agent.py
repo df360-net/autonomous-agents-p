@@ -28,7 +28,7 @@ except Exception:
 p = argparse.ArgumentParser()
 p.add_argument("subject")
 p.add_argument("--body", default="")
-p.add_argument("--host", default="192.168.0.21")
+p.add_argument("--host", default="192.168.0.105")
 p.add_argument("--smtp-port", type=int, default=1025)
 p.add_argument("--imap-port", type=int, default=1143)
 p.add_argument("--boss", default="boss@agents.local")

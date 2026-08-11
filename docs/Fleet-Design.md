@@ -438,7 +438,7 @@ hand at 3am without Docker Desktop running.
 3. **`WORKSPACE_ROOT` as both memory and scratch, inside the container** — blocks cattle, blocks
    migration, blocks rolling upgrade.
 4. **`AGENT_NAME` / `AGENT_ADDRESS` as independent self-asserted env** — identity by convention.
-5. **`APP_HOST=192.168.0.21`** interpolated into prompt text, `agent_delivery`, `cluster.py`,
+5. **`APP_HOST=192.168.0.105`** interpolated into prompt text, `agent_delivery`, `cluster.py`,
    `governance_app`, notification bodies.
 6. **`GITHUB_OWNER` as one user account** — no org, hence no org runners, hence polling; and one
    global repo namespace.

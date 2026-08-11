@@ -83,7 +83,7 @@ The loop, the tools, the model — unchanged. The leverage is in the plumbing ar
                     └───────────────────────────────────────────────┘
 ```
 
-Three containers on one Compose bridge on Zeenie (192.168.0.21). `agents.local` exists only
+Three containers on one Compose bridge on Zeenie (192.168.0.105). `agents.local` exists only
 inside that network — no external domain, no DNS, no TLS. Deliberate for the MVP. The lower half
 is the pre-existing EPLX estate the fleet now delivers through (§9).
 
@@ -290,7 +290,7 @@ agent checks its own work, not how the work reaches anyone. Real delivery is §9
 - The reviewer **curls it** — from inside and outside — and is told not to settle for HTTP 200.
 
 Proven: *"Build me a tic-tac-toe web app… send me the link"* → html/css/js + a Node static server,
-backgrounded, `http://192.168.0.21:3001` in the reply, independently fetched by validator1
+backgrounded, `http://192.168.0.105:3001` in the reply, independently fetched by validator1
 (`grep -c 'class="cell"'` → 9), opened and played in a browser.
 
 **Known limits of the local server** — and the reason §9 exists: it dies when the container
@@ -410,7 +410,7 @@ for one app, the calculator. This section connects the fleet to it.
               ▼
     agent-app-proxy   31000+N ──▶ learn-control-plane:30000+N ──▶ the pod
               ▼
-         http://192.168.0.21:3100N  in your browser
+         http://192.168.0.105:3100N  in your browser
 ```
 
 ### Five decisions, each forced by something measured
@@ -500,7 +500,7 @@ credentials will otherwise report having shipped.
 **Proven end to end (2026-08-02).** A hand-written probe app — deliberately not agent-built, to
 separate pipeline faults from agent faults — went `git push` → CI green on the first run →
 `ghcr.io/df360-net/agent-pipeline-probe:cc1cdf8` → Harness `Success` → two pods `1/1` in
-`agent-apps` → **`http://192.168.0.21:31000` answering HTTP 200 in a browser**, the page naming its
+`agent-apps` → **`http://192.168.0.105:31000` answering HTTP 200 in a browser**, the page naming its
 own pod (`pipeline-probe-5498fbf8f8-sbpf4`). The probe stays as a reference deployment.
 
 **Not yet wired:** the ci-watcher pod, the governance changes that consume a per-app event, and the
@@ -523,7 +523,7 @@ approval gate for agent apps. That deploy was triggered by calling Harness direc
 | `REVIEW_RESULT_CHARS` / `REVIEW_TRANSCRIPT_CHARS` | 800 / 20000 | how much record the reviewer is shown |
 | `MAX_REPLY_CHARS` | 40000 | reply body cap |
 | `NOTES_MAX_CHARS` | 8000 | per notes file, when pasted into a task (§8) |
-| `APP_HOST` / `APP_PORT_BASE` / `APP_PORT_COUNT` | 192.168.0.21 / 3000 / 10 | local preview ports |
+| `APP_HOST` / `APP_PORT_BASE` / `APP_PORT_COUNT` | 192.168.0.105 / 3000 / 10 | local preview ports |
 | `GITHUB_TOKEN` | — | PAT with **`repo` + `workflow`** scope. Unset = delivery disabled and the agent is told to say so (§9) |
 | `GITHUB_OWNER` | `df360-net` | repos become `<owner>/agent-<app>`, images `ghcr.io/<owner>/agent-<app>` |
 | `K8S_NAMESPACE` | `agent-apps` | where Harness deploys agent apps |

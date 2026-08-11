@@ -14,7 +14,7 @@ node's own interfaces — so `learn-control-plane:30000` is an ordinary TCP endp
 sibling container. This proxy sits there and republishes a block of them on ports Docker
 publishes normally.
 
-    browser -> 192.168.0.21:3100N -> [this container] -> learn-control-plane:3000N -> pod
+    browser -> 192.168.0.105:3100N -> [this container] -> learn-control-plane:3000N -> pod
 
 One process, one port block, N listeners. Adding an app needs no change here: the agent
 picks NodePort 3000N in its manifest and the matching 3100N is already listening. A slot

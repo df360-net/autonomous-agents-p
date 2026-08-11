@@ -101,7 +101,7 @@ x-agent-env: &agent-env
   MEMORY_FLEET_REMOTE: "${MEMORY_FLEET_REMOTE:-/remotes/fleet-knowledge.git}"
   # Where to tell you the app is. Must be an address YOUR browser can reach — the
   # container's own hostname is useless to you, so this is Zeenie's LAN IP.
-  APP_HOST: "${APP_HOST:-192.168.0.21}"
+  APP_HOST: "${APP_HOST:-192.168.0.105}"
   # Delivery: how the agent ships an app down the real CI/CD pipeline instead of leaving
   # a dev server running. Needs a PAT with `repo` AND `workflow` scope — without the
   # latter, GitHub rejects any push touching .github/workflows/ with a misleading error.

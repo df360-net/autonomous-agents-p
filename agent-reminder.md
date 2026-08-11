@@ -101,8 +101,17 @@ result + what it built + how it tested it.
 ## 5. Environment facts (verified — trust these)
 
 **Runtime target = Zeenie (the user's 2nd laptop).** Everything runs there; you drive it over SSH.
-- Connect: `ssh zeenie` (alias in `~/.ssh/config`) → `192.168.0.21`, user `jianm`, key
-  `~/.ssh/id_ed25519`. DHCP-reserved IP (stable).
+- Connect: `ssh zeenie` (alias in `~/.ssh/config`) → `192.168.0.105`, user `jianm`, key
+  `~/.ssh/id_ed25519`. HAND-ASSIGNED STATIC, not a DHCP reservation: the NETGEAR C6300BD
+  could not hold reservations for this many devices, so the pool was cut to .2–.99 and every
+  box given a fixed address at .100+. It will not drift across a reboot.
+- **A second runtime box exists**: `ssh murphy` → `192.168.0.104`, `LAPTOP-MURPHY`, Win11,
+  user `jianm`, same key, admin over SSH. Blank — nothing of ours runs there yet. It is the
+  box to reach for when the fleet should span two machines. Same cmd.exe caveat as Zeenie.
+  Its Wi-Fi profile is already pinned Private and its OpenSSH firewall rule set to all
+  profiles, so it survives the reboot failure described below. ZEENIE IS NOT PINNED.
+- Rest of the LAN, all static: elitebook .100 (Ubuntu 26.04, user `jay`), hp-tiger .102/.101,
+  lenovo .103.
 - **Remote default shell over SSH is cmd.exe**, NOT bash. Chain with `&` / `&&`; no `head`, `;`,
   or unix pipes. For anything richer: `ssh zeenie 'powershell -NoProfile -Command "..."'`.
 - Docker Desktop **v29.5.3**. **After a Windows reboot on Zeenie, SSH breaks two ways:** (1) Wi-Fi
@@ -217,7 +226,7 @@ things worth knowing:
 
 </details>
 
-Roundcube: `http://192.168.0.21:8080`, log in as `boss@agents.local`. Mailbox passwords live in
+Roundcube: `http://192.168.0.105:8080`, log in as `boss@agents.local`. Mailbox passwords live in
 `.env` on Zeenie (gitignored) and are written there by `provision-agent.ps1` — do not
 hand-write them, or the mailbox and the file drift apart.
 
@@ -323,7 +332,7 @@ An agent that builds a web app you cannot open is a demo. Three things had to ch
   thing (it ran `curl -s localhost:3001/ | grep -c 'class="cell"'` → 9).
 
 **Proven 2026-08-01:** "Build me a tic-tac-toe web app… send me the link" → agent1 wrote
-html/css/js + a Node static server, backgrounded it, reported `http://192.168.0.21:3001`;
+html/css/js + a Node static server, backgrounded it, reported `http://192.168.0.105:3001`;
 validator1 independently fetched it from both inside and outside; the user played it in a
 browser. Claude then drove the real `game.js` through its own DOM harness: win, freeze after
 win, taken-cell ignored, nine-move tie, New Game keeps the score, Reset Scores clears it — all
@@ -425,7 +434,7 @@ short version for future-you:
   `github_ci_cd/governance/harness_apps.py` (clones `deployweb` per app via the Harness API).
 - **Ports: app slot N gives 3000+N local preview, 30000+N NodePort, 31000+N browser.**
 - **PROVEN 2026-08-02:** a hand-written probe app went push → CI green → ghcr → Harness → 2 pods →
-  `http://192.168.0.21:31000` in a browser. Kept as a reference deployment.
+  `http://192.168.0.105:31000` in a browser. Kept as a reference deployment.
 - **NOT wired yet:** ci-watcher pod, governance per-app routing, the approval gate for agent apps.
   That probe was deployed by calling `harness_apps.py deploy` directly, bypassing all three.
 - **Needs Jianmin:** `GITHUB_TOKEN` in `.env` on Zeenie, PAT with `repo` AND `workflow` scope.

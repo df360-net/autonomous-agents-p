@@ -93,7 +93,7 @@ Everything that does *not* hit a registry — `compose up` on cached images, `ps
 docker compose logs -f agent-worker
 ```
 
-**5. Use it.** Open `http://192.168.0.21:8080`, log in as `boss@agents.local`, and email
+**5. Use it.** Open `http://192.168.0.105:8080`, log in as `boss@agents.local`, and email
 `agent1@agents.local`:
 
 > Subject: Build a tic-tac-toe web app

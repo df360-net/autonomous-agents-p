@@ -49,7 +49,7 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
 VALIDATION_ROUNDS = int(os.environ.get("VALIDATION_ROUNDS", "3"))
 # Anything the agent builds that serves HTTP has to land on a port published by compose, or you
 # cannot open it. One port per task, cycling through the published range.
-APP_HOST = os.environ.get("APP_HOST", "192.168.0.21")
+APP_HOST = os.environ.get("APP_HOST", "192.168.0.105")
 APP_PORT_BASE = int(os.environ.get("APP_PORT_BASE", "3000"))
 APP_PORT_COUNT = int(os.environ.get("APP_PORT_COUNT", "10"))
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
