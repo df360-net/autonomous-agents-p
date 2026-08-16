@@ -10,11 +10,35 @@ it. Real delivery on this estate already exists — it was built for the calcula
     agent writes Dockerfile + k8s manifest + CI file
     agent pushes to github.com/<owner>/agent-<app>
     GitHub Actions (GitHub-hosted)  : test -> build -> push ghcr.io/<owner>/agent-<app>:<sha>
+    ─────────────────────────────── EVERYTHING BELOW THIS LINE IS GONE ───────────────────
     ci-watcher pod                  : polls the Actions API -> ArtifactReady -> Kafka
     governance pod                  : SCAN -> CR -> AWAITING_APPROVAL  <- a HUMAN approves
                                       -> creates/【re】uses a Harness service+pipeline
     Harness delegate                : rolling deploy into namespace `agent-apps`
     agent-app-proxy                 : 3100N -> kind node NodePort 3000N  -> a browser URL
+
+THE DEPLOY LEG IS OFFLINE AS OF 2026-08-16, AND THE PIPELINE REALLY DOES STOP AT THE IMAGE.
+Kafka/redpanda were stopped and github_ci_cd's governance app was repurposed, so the four
+steps struck through above no longer run — an image is built and then nothing collects it.
+
+Being replaced by a fleet control plane (registry on hp-tiger:8091, a per-box daemon, a
+reconciler), where the whole middle collapses into one call: ship_app registers the app, the
+control plane assigns the box, the NodePort and the URL, and emails the live address itself.
+The agent will stop doing port arithmetic entirely — see `ports_for` below, which is the
+thing that goes.
+
+WHAT THAT MEANS FOR THIS FILE TODAY. The prose in `delivery_note` was changed to say the
+deployment step is offline and to forbid reporting a cluster URL, and the same correction is
+in agent_brain's system prompt and in ship_app's post-build output. All three are marked
+TEMPORARY and all three must be reverted together when the new leg lands — they are one
+story told in three places, and a pipeline described two different ways is how an agent ends
+up inventing a third.
+
+Why it was worth changing rather than waiting: the URL was pure arithmetic
+(`PROXY_PORT_BASE + slot`), so it could be produced whether or not anything was listening.
+An agent that emails a computed address for an app nothing deployed has written a plausible
+false sentence a human will act on — the exact failure the no-token branch of
+`delivery_note` was written to prevent.
 
 THE NUMBERS. Each app owns ONE index N in 0..9 and gets three ports from it:
 
@@ -172,9 +196,13 @@ def ci_workflow(app):
 MANIFEST_EXAMPLE = """\
 # k8s/deployment.yaml — Deployment + NodePort Service.
 #
-# The image is `{{{{.Values.image}}}}`, NOT a tag you write. Harness renders this manifest as a Go
-# template against a values file holding the exact build being deployed, so a hardcoded tag
-# here would be a lie the moment anything is released. Leave the expression alone.
+# WRITE A REAL IMAGE TAG HERE. This manifest used to carry a Go template expression instead of
+# a tag, because a deployer rendered it against the exact build being released. That deployer
+# is gone (see the module docstring), so nothing renders anything now: a template expression
+# left in this file is not "filled in later", it is a literal string that no cluster can pull.
+# Its replacement takes the image from a registration call, not from this file, which makes
+# this manifest a description of what you built rather than the instruction that deploys it.
+# Put the tag `ship_app status` printed on a green build.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -201,7 +229,7 @@ spec:
         - name: ghcr-cred
       containers:
         - name: {app}
-          image: {{{{.Values.image}}}}        # Harness renders this; do not hardcode a tag
+          image: {registry}/{owner}/agent-{app}:<the-sha-from-ship_app-status>
           ports:
             - containerPort: {container_port}
           env:
@@ -239,6 +267,7 @@ def manifest_example(app, index, container_port=8080, health="/healthz"):
     return MANIFEST_EXAMPLE.format(
         app=slug(app), ns=K8S_NAMESPACE, container_port=container_port,
         health=health, node_port=ports_for(index)["node"],
+        registry=REGISTRY, owner=GITHUB_OWNER,
     )
 
 
@@ -489,16 +518,36 @@ def delivery_note(assets_text, has_token):
         "Do not report success until `ship_app status` actually says success. If it fails, "
         "read the log, fix it, and push again — a red build is not delivery.\n"
         "\n"
-        "AFTER THAT IT IS OUT OF YOUR HANDS, and you must say so rather than implying the app "
-        "is live. A human still has to approve the release in the governance dashboard, and "
-        "only then does Harness deploy it. When it is approved it will answer at "
-        f"{p['url']} — offer that as the eventual address, clearly marked as pending "
-        "approval. Do not curl it and report it as down; it is not deployed yet.\n"
+        # TEMPORARY — REMOVE WHEN THE FLEET CONTROL PLANE'S DEPLOY LEG LANDS.
+        # The chain this paragraph used to describe (approve in the dashboard, Harness rolls
+        # it out, answer at a computed URL) no longer exists: Kafka/ci-watcher/Harness were
+        # retired and the app that drove them was repurposed. The replacement — register with
+        # the fleet control plane, which assigns the box, the NodePort and the URL, and emails
+        # the live address itself — is being built. Until it does, the pipeline genuinely
+        # stops at the image, and the agent must be told so.
+        #
+        # Saying nothing was not an option. The URL was arithmetic, `PROXY_PORT_BASE + slot`,
+        # so it could always be produced whether or not anything was listening on it — and an
+        # agent that offers a computed address for an app nothing deployed has written a
+        # plausible sentence that is false, in an email a human will act on. Same reason the
+        # no-token branch above exists at all.
+        "AFTER THAT IT IS OUT OF YOUR HANDS, AND RIGHT NOW IT STOPS THERE. The deployment "
+        "step is offline: the system that used to take a built image and run it in the "
+        "cluster is being replaced, and its replacement is not finished. CI still builds and "
+        "publishes your image, and that is real work that will be deployed once the new "
+        "pipeline lands — but nothing deploys it today.\n"
+        "\n"
+        "So: DO NOT GIVE ANYONE A CLUSTER URL for this app. Not as a live address, not as a "
+        "pending one. There is no address to give, and a URL in an email is a promise someone "
+        "will click. Say plainly that the image is built and waiting for deployment, which "
+        "is the honest and complete answer. The local preview URL is still worth offering, "
+        "clearly labelled as a preview that dies with this container.\n"
         "\n"
         f"Your repo will be github.com/{GITHUB_OWNER}/agent-<app-name> and your image "
-        f"{REGISTRY}/{GITHUB_OWNER}/agent-<app-name>. Record all of it in AGENT-ASSETS.md: "
-        f"repo, image, app slot {idx}, NodePort {p['node']}, URL {p['url']}, and the fact "
-        "that the deploy is gated on human approval.\n"
+        f"{REGISTRY}/{GITHUB_OWNER}/agent-<app-name>. Record in AGENT-ASSETS.md: repo, image, "
+        f"app slot {idx}, NodePort {p['node']}, and that it is BUILT BUT NOT DEPLOYED. Do not "
+        "record a URL for it — a URL in your notes is one you will repeat as fact in a later "
+        "task, long after you have forgotten it was never true.\n"
         "\n"
         "--- .github/workflows/ci.yml (copy verbatim, replacing __REPO__ handling is already "
         "done for you once you know the app name) ---\n"

@@ -358,9 +358,15 @@ def cmd_status(app):
         return 3
     if concl == "success":
         print(f"image      {d.image_name(app)}:{sha}")
+        # TEMPORARY — REMOVE WHEN THE FLEET CONTROL PLANE'S DEPLOY LEG LANDS. See the matching
+        # note in agent_delivery.delivery_note. This line is what the agent READS BACK after a
+        # green build, so it is the last chance to stop "CI passed" being reported as "it is
+        # running". It has to agree with the task notes; two different stories about the same
+        # pipeline is how an agent ends up splitting the difference and inventing a third.
         print("\nCI PASSED. The image is in the registry.")
-        print("It is NOT deployed: a human must approve the release in the governance")
-        print("dashboard, and only then does Harness roll it out. Say that in your reply.")
+        print("It is NOT deployed, and cannot be right now: the deployment step is offline")
+        print("while it is rebuilt. There is no cluster URL for this app — do not report one.")
+        print("Say in your reply that the image is built and waiting for deployment.")
         return 0
     print(f"\nCI FAILED ({concl}). Read the log:  ship_app logs {d.slug(app)}")
     return 1
