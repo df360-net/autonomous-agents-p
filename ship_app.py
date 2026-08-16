@@ -26,13 +26,13 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delivery as d
 import fleet_identity
+import git_auth
 
 API = "https://api.github.com"
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -93,24 +93,17 @@ def run(args, cwd=None, check=True, quiet=False, env=None):
 def git_env():
     """Hand the token to git via an askpass script rather than the remote URL.
 
-    A token embedded in `origin` survives in .git/config, gets echoed by `git remote -v`,
-    and lands in any log that prints the push command. This keeps it in a temp file that
-    exists only for the life of the process.
+    The mechanism moved to git_auth so agent_memory can use the same one — memory pushes to
+    GitHub now too, and two implementations of credential handling means the one that does not
+    get the next fix is the one that leaks. What stays here is only what is specific to
+    shipping an app: the commit identity.
     """
-    env = dict(os.environ)
-    helper = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
-    helper.write("#!/bin/sh\ncase \"$1\" in *Username*) echo \"$GH_USER\";; *) echo \"$GH_PASS\";; esac\n")
-    helper.close()
-    os.chmod(helper.name, 0o700)
+    env, cleanup = git_auth.env_for("https://github.com/")
     env.update({
-        "GIT_ASKPASS": helper.name,
-        "GH_USER": OWNER,
-        "GH_PASS": TOKEN,
-        "GIT_TERMINAL_PROMPT": "0",          # never hang waiting for a password
         "GIT_AUTHOR_NAME": GIT_NAME, "GIT_COMMITTER_NAME": GIT_NAME,
         "GIT_AUTHOR_EMAIL": GIT_EMAIL, "GIT_COMMITTER_EMAIL": GIT_EMAIL,
     })
-    return env, helper.name
+    return env, cleanup
 
 
 # ---- commands ---------------------------------------------------------------
@@ -140,10 +133,16 @@ def cmd_scaffold(app, directory):
     with open(os.path.join(directory, OWNER_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{fleet_identity.AGENT_ID}\n")
 
+    # TEMPORARY — REMOVE WITH THE OTHER THREE WHEN THE DEPLOY LEG LANDS. This printed the
+    # computed cluster URL "only after a human approves the release", which is the same claim
+    # already corrected in delivery_note, agent_brain and `ship_app status`. Missing it here
+    # would have been worse than not fixing any of them: scaffold is the FIRST thing an agent
+    # runs, so this line sets the expectation that the later corrections then contradict.
     p = d.ports_for(idx)
     print(f"\napp      {d.slug(app)}\nrepo     github.com/{OWNER}/{repo}\n"
           f"image    {d.image_name(app)}\napp slot {idx}\n"
-          f"NodePort {p['node']}\nURL      {p['url']}   (only after a human approves the release)")
+          f"NodePort {p['node']}\nURL      none — the deployment step is offline while it is "
+          f"rebuilt; do not report a cluster URL for this app")
     print("\nStill yours to write: Dockerfile (must honour $PORT) and ci/test.sh.")
 
 
@@ -286,7 +285,7 @@ def cmd_push(app, directory, message=None):
         die(conflict)
 
     _ensure_repo(repo)
-    env, helper = git_env()
+    env, cleanup = git_env()
     try:
         if not os.path.isdir(os.path.join(directory, ".git")):
             run(["git", "init", "-b", "main"], cwd=directory, env=env)
@@ -306,10 +305,7 @@ def cmd_push(app, directory, message=None):
             run(["git", "remote", "add", "origin", url], cwd=directory, env=env)
         run(["git", "push", "-u", "origin", "main"], cwd=directory, env=env)
     finally:
-        try:
-            os.unlink(helper)
-        except OSError:
-            pass
+        cleanup()
 
     print(f"\npushed to github.com/{OWNER}/{repo}")
     print(f"actions: https://github.com/{OWNER}/{repo}/actions")

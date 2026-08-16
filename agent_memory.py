@@ -51,6 +51,7 @@ import subprocess
 import time
 
 import fleet_identity
+import git_auth
 
 # Two remotes, both optional. UNSET MEANS OFF: with neither configured this module reports
 # disabled and agent_notes keeps every file in the workspace exactly where it is today. That is
@@ -107,7 +108,7 @@ def enabled():
 
 
 # ---- git ---------------------------------------------------------------------
-def _git(args, cwd=None, check=True):
+def _git(args, cwd=None, check=True, remote=None):
     """One git invocation. Identity is passed per-command rather than configured globally so a
     commit is attributed to this agent even in a container whose global config says otherwise —
     the attribution is the audit trail, and it should not depend on image build order."""
@@ -120,10 +121,22 @@ def _git(args, cwd=None, check=True):
     cmd = ["git",
            "-c", f"user.name={fleet_identity.AGENT_ID}",
            "-c", f"user.email={fleet_identity.AGENT_ADDRESS}"] + args
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    # `remote` is passed only by the calls that actually talk to one. A local path needs no
+    # credential, and asking for one anyway would write a helper file per fetch for nothing.
+    env, cleanup = git_auth.env_for(remote or "")
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+                           env=env)
+    finally:
+        cleanup()
     if check and p.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed ({p.returncode}): "
-                           f"{(p.stderr or p.stdout).strip()[:400]}")
+        # Redacted because this string reaches the container log, and from there a human's
+        # inbox. git does not echo an askpass credential, but this process HAS the token in
+        # its environment and a subprocess that dumps its environment on failure would carry
+        # it out through exactly this line.
+        raise RuntimeError(git_auth.redact(
+            f"git {' '.join(args)} failed ({p.returncode}): "
+            f"{(p.stderr or p.stdout).strip()[:400]}"))
     return p
 
 
@@ -185,7 +198,7 @@ def _clone(remote, path, writable):
             # a clone that nothing else ever reads.
             _git(["remote", "set-url", "--push", "origin",
                   "readonly-do-not-push://global-scope-is-operator-only"], cwd=staging)
-        _git(["fetch", "origin"], cwd=staging)
+        _git(["fetch", "origin"], cwd=staging, remote=remote)
         if _git(["rev-parse", "--verify", "origin/main"], cwd=staging,
                 check=False).returncode == 0:
             _git(["reset", "--hard", "origin/main"], cwd=staging)
@@ -208,11 +221,14 @@ def _unpushed(path):
     return p.returncode != 0 or p.stdout.strip() not in ("0", "")
 
 
-def _pull(path):
-    _git(["fetch", "origin"], cwd=path)
+def _pull(path, remote):
+    """`remote` is required, not defaulted. It only exists to carry the credential, and a
+    default would make a missing one look like a local-path pull that needs none — which is
+    exactly how an authenticated fetch fails as "repository not found"."""
+    _git(["fetch", "origin"], cwd=path, remote=remote)
     if _git(["rev-parse", "--verify", "origin/main"], cwd=path, check=False).returncode != 0:
         return                                     # remote is still empty; nothing to pull
-    _git(["pull", "--rebase", "--autostash", "origin", "main"], cwd=path)
+    _git(["pull", "--rebase", "--autostash", "origin", "main"], cwd=path, remote=remote)
 
 
 # ---- Seeding from what already exists ----------------------------------------
@@ -297,7 +313,7 @@ def sync(workspace_root=None, scopes=None):
                 _ensure_local_remote(remote)
                 _clone(remote, path, writable)
             else:
-                _pull(path)
+                _pull(path, remote)
             _state["online"] = True
             lines.append(f"memory: {path} <- {remote} ok")
         except Exception as e:
@@ -362,7 +378,7 @@ def publish(task_id="", note=""):
 
     for attempt in range(1, PUSH_ATTEMPTS + 1):
         try:
-            _git(["push", "origin", "main"], cwd=TENANT_DIR)
+            _git(["push", "origin", "main"], cwd=TENANT_DIR, remote=TENANT_REMOTE)
             _retire_workspace_copies()
             return f"memory: pushed {task_id}" + (f" (attempt {attempt})" if attempt > 1 else "")
         except Exception as e:
@@ -373,8 +389,14 @@ def publish(task_id="", note=""):
             # Somebody else pushed first, which at N>1 is ordinary rather than exceptional.
             # Rebase onto them and try again; the union merge driver keeps both sets of notes.
             try:
-                _pull(TENANT_DIR)
+                _pull(TENANT_DIR, TENANT_REMOTE)
             except Exception:
+                # SWALLOWED ON PURPOSE — retry is the point — WHICH IS WHY THE ARGUMENTS ABOVE
+                # MATTER. A NameError here is indistinguishable from "the remote was busy": the
+                # rebase silently never happens, all three attempts fail, and the agent reports
+                # a push failure with a plausible git error attached. That happened, and only
+                # test_memory caught it, because it asserts on the MERGED FILE rather than on
+                # the exit code — the same reason the union-driver bug was found.
                 time.sleep(1)
     return "memory: push failed"
 
