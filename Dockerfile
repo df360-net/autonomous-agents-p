@@ -32,10 +32,14 @@ COPY tests/ /app/tests/
 
 # `ship_app` is the agent's only sanctioned route to GitHub — a command on PATH rather than
 # instructions to hand-roll git remotes and API calls. See ship_app.py for why.
+# NO GLOBAL GIT IDENTITY IS BAKED IN. It used to say agent1, which was invisible while one
+# machine built one image for one agent and becomes wrong the moment this single image runs as
+# agent1 through agent4: every commit not made through agent_memory or ship_app — both of
+# which pass identity per-invocation — would be attributed to agent1 regardless of who made
+# it, in the one place that cannot be corrected afterwards. An image shared by four identities
+# must not carry one of them.
 RUN printf '#!/bin/sh\nexec python3 /app/ship_app.py "$@"\n' > /usr/local/bin/ship_app \
     && chmod +x /usr/local/bin/ship_app \
-    && git config --global user.name  "agent1" \
-    && git config --global user.email "agent1@agents.local" \
     && git config --global init.defaultBranch main \
     && git config --global --add safe.directory '*'
 

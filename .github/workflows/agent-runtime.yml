@@ -1,0 +1,85 @@
+# Builds the agent runtime image and pushes it to ghcr, so an agent can run as a POD on any
+# box in the fleet instead of only where its source happens to be checked out.
+#
+# WHY THIS EXISTS AT ALL. The agent was `build: .` in docker-compose, built locally on zeenie.
+# That is why it could not run on hp-tiger: there was no artefact, only a recipe and one
+# machine that had run it. This workflow turns the agent into the same kind of thing the
+# agents themselves ship — an image, addressed by digest, pullable from anywhere.
+#
+# TAGS. Two are pushed and only one is ever deployed:
+#
+#     agent-runtime:<git-sha>   <- what the fleet declares. Immutable.
+#     agent-runtime:main        <- convenience for humans. NEVER declared.
+#
+# The fleet record names a SHA because a moving tag turns "restart the pod" into "silently
+# upgrade every agent", and turns a rollback from a spec change into an argument about what
+# `main` pointed at last Tuesday. It also makes "which code is agent3 running?" answerable
+# from the fleet record alone, without correlating timestamps.
+name: agent-runtime
+
+on:
+  push:
+    branches: [main]
+    # Documentation and the infra repo do not change the runtime. Skipping them keeps the SHA
+    # list short enough that "which build is this?" stays answerable by eye.
+    paths-ignore: ["**/*.md", "docs/**"]
+  workflow_dispatch:            # so a rebuild can be forced without an empty commit
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-runtime
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write           # required to push to ghcr under this org
+    steps:
+      - uses: actions/checkout@v4
+
+      # THE TESTS GATE THE IMAGE. An agent image that boots and misbehaves is worse than one
+      # that does not build: it deploys, reports healthy, and spends money doing the wrong
+      # thing. These suites are the same ones that caught a kill switch failing open and a
+      # rebase that silently never happened, and they need no network or mail server.
+      - name: Run the suites that gate a release
+        run: |
+          set -e
+          for f in tests/test_budget.py tests/test_deliverable.py tests/test_envelope.py \
+                   tests/test_fleet_control.py tests/test_gate.py tests/test_git_auth.py \
+                   tests/test_identity.py tests/test_mailflow.py tests/test_memory.py \
+                   tests/test_notes.py tests/test_peer.py tests/test_principal.py; do
+            echo "== $f"
+            python "$f"
+          done
+        # test_faultinject is deliberately NOT here: it calls the real DeepSeek API, needs a
+        # key, costs money per run, and is non-deterministic — it has returned opposite
+        # verdicts on identical input. A gate that fails randomly gets ignored, and an ignored
+        # gate is worse than an absent one.
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          # Layer cache in the registry: the apt+node layer is the expensive one and it
+          # changes far less often than the Python sources copied above it.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      - name: The line infra needs
+        run: |
+          echo "### Declare this image" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ env.IMAGE }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
