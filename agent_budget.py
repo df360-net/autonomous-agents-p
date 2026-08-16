@@ -31,6 +31,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import fleet_control
 import fleet_identity
 
 # ---- Identity ----------------------------------------------------------------
@@ -83,6 +84,9 @@ PRICE_OUTPUT_PER_M = float(os.environ.get("PRICE_OUTPUT_PER_M", "1.10"))
 
 _lock = threading.Lock()
 _task = {"id": None, "requester": None, "usd": 0.0}
+# What the control plane last told us, and whether the last write to it landed. `broken` is the
+# fail-closed latch: set when a spend could not be recorded, cleared by the next one that can.
+_remote = {"broken": None, "over": False, "total": None, "ceiling": None}
 _recent = {"path": None, "at": 0.0, "usd": 0.0}   # memoised 24h total, see _spent_24h
 RECENT_TTL = float(os.environ.get("BUDGET_RECENT_TTL", "30"))
 
@@ -162,6 +166,29 @@ def record(usage, model=None, role="worker"):
             _append(FLEET_LEDGER, line)
     except OSError as e:
         print(f"[budget] could not write the ledger ({e}) — the run continues", flush=True)
+
+    # THE LOCAL WRITE HAPPENS FIRST AND IS THE WRITE-AHEAD LOG. If the control plane is down,
+    # the spend is still on disk here and can be reconciled later; losing the record entirely
+    # because a remote was unreachable would be the worst of both designs.
+    #
+    # A failure does NOT raise. This runs after the model call, so the money is already spent
+    # and refusing now prevents nothing — it would only throw away the answer we paid for.
+    # It is remembered instead, and `check()` refuses the NEXT call, which is the first moment
+    # refusing actually saves anything.
+    if fleet_control.enabled():
+        try:
+            answer = fleet_control.record_spend(AGENT_ID, usd, detail=_task["id"])
+            with _lock:
+                _remote["broken"] = None
+                _remote["over"] = bool((answer or {}).get("over"))
+                _remote["total"] = (answer or {}).get("total")
+                _remote["ceiling"] = (answer or {}).get("ceiling")
+        except OSError as e:
+            with _lock:
+                _remote["broken"] = str(e)
+            print(f"[budget] could not record ${usd:.4f} with the fleet control plane ({e}) — "
+                  f"it is in the local ledger, and the next call will be refused until the "
+                  f"control plane answers again", flush=True)
     return usd
 
 
@@ -235,8 +262,38 @@ def limits():
 
 def paused():
     """The fleet kill switch. Checked before any mail is fetched, so a pause consumes nothing
-    and the backlog is intact when it is cleared."""
+    and the backlog is intact when it is cleared.
+
+    TWO SOURCES, EITHER OF WHICH CAN STOP THE WORK, and deliberately not one replacing the
+    other. The control plane is the fleet-wide switch and the only one that still works when
+    agents are PODs on different boxes. The local file stays because it is the switch that
+    works when everything else is broken: an operator with a shell can stop this container
+    without the network, the API or a token, and `pause()` below still writes it when a
+    ceiling trips. A control that needs a healthy distributed system to say "stop" is a
+    control that is missing on the day you most want it.
+
+    They fail in opposite directions ON PURPOSE. An unreadable local file reads as "not
+    paused", which is right — it means something is wrong with this container, and pausing
+    would not fix it. An unreachable control plane reads as "paused", which is also right —
+    it means nobody can stop the fleet, and spending on through that is how a runaway night
+    happens. See fleet_control for why "unset" is a third case that must not be confused with
+    either.
+    """
+    remote, reason = fleet_control.paused()
+    if remote:
+        _log_pause_reason(reason)
+        return True
     return os.path.exists(PAUSE_FILE)
+
+
+_pause_reported = {"reason": None}
+
+
+def _log_pause_reason(reason):
+    """Say why once, not every twenty seconds."""
+    if reason and _pause_reported["reason"] != reason:
+        _pause_reported["reason"] = reason
+        print(f"[budget] PAUSED: {reason}", flush=True)
 
 
 def pause(reason):
@@ -257,8 +314,17 @@ def startup_report():
     cap = limits()
     lines = [f"budget: task ${cap['task']:.0f} | {AGENT_ID} daily ${cap['daily']:.0f} | "
              f"fleet ${cap['fleet']:.0f} | ledger {LEDGER}"]
+    lines += fleet_control.startup_report()
     shared = FLEET_LEDGER != LEDGER
-    if shared:
+    if fleet_control.enabled():
+        # The warning below is about a per-agent file pretending to be a fleet control. With
+        # the control plane in use that is no longer the operative risk — the plane counts
+        # every agent — so saying it anyway would train the reader to skip the block that also
+        # carries the real warnings.
+        lines.append(f"budget: fleet total and kill switch come from the control plane; "
+                     f"{LEDGER} is the local write-ahead log and {PAUSE_FILE} is the "
+                     f"break-glass switch that works without a network")
+    elif shared:
         lines.append(f"budget: fleet ledger {FLEET_LEDGER}, kill switch {PAUSE_FILE}")
     else:
         lines.append(
@@ -291,6 +357,34 @@ def check():
             f"{AGENT_ID} has spent ${day:.2f} in the last 24h, at its ${cap['daily']:.2f} "
             f"ceiling (AGENT_DAILY_USD)."
         )
+    # THE FLEET CEILING, WHEN THE FLEET IS NOT ON ONE BOX. Two checks, in the order that costs
+    # least to be wrong about.
+    #
+    # First the latch: a spend that could not be recorded is a spend nobody is counting, and
+    # continuing past it means the ceiling is being checked against a total that is already
+    # known to be short. Refusing here is the fail-closed half of the ledger migration, and
+    # this is the first moment in the call path where refusing prevents anything.
+    if fleet_control.enabled():
+        with _lock:
+            broken, over, total, ceiling = (_remote["broken"], _remote["over"],
+                                            _remote["total"], _remote["ceiling"])
+        if broken:
+            raise BudgetExceeded(
+                f"the last spend could not be recorded with the fleet control plane "
+                f"({broken}). Refusing to start another call while the fleet total is "
+                f"unknown — the work already done is in the workspace and the spend is in "
+                f"this agent's local ledger."
+            )
+        # Then the plane's own verdict. `over` is computed there against the authoritative
+        # total across every agent, which is the number a per-box file cannot see.
+        if over:
+            pause(f"the fleet control plane reports {AGENT_ID} over its ceiling "
+                  f"(${total} of ${ceiling}), tripped on task {task_id}.")
+            raise BudgetExceeded(
+                f"the fleet control plane reports ${total} spent against a ${ceiling} "
+                f"ceiling. Stopping."
+            )
+
     fleet = _spent_24h(FLEET_LEDGER) if FLEET_LEDGER != LEDGER else day
     if fleet >= cap["fleet"]:
         # The one ceiling that stops the whole fleet, so it leaves a mark a human must clear.
