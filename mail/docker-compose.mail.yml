@@ -32,8 +32,20 @@ services:
     hostname: mail.agents.local
     environment:
       - POSTMASTER_ADDRESS=postmaster@agents.local
-      # See the header. Not cosmetic: without this there is no AUTH to enable.
-      - SSL_TYPE=self-signed
+      # See the header. Not cosmetic: without TLS there is no AUTH to enable.
+      #
+      # `manual`, NOT `self-signed`. The certificate is still self-signed — what differs is who
+      # makes it. SSL_TYPE=self-signed reads as "the server generates one" and does not: DMS v15
+      # expects the files to exist already and aborts during TLS setup when they do not, which
+      # is how this stack failed to come up on hp-tiger the first time. `manual` with explicit
+      # paths means the certificate has exactly one location, named here, with no dependency on
+      # a discovery convention that can change between versions — and a missing file then says
+      # "no such file" instead of failing inside TLS setup.
+      #
+      # Run ./make-certs.sh BEFORE the first `up`. It is idempotent.
+      - SSL_TYPE=manual
+      - SSL_CERT_PATH=/tmp/docker-mailserver/ssl/cert.pem
+      - SSL_KEY_PATH=/tmp/docker-mailserver/ssl/key.pem
       # REMOVED DELIBERATELY: PERMIT_DOCKER=connected-networks.
       # That is what made :25 an open relay for anything sharing the network, which was a
       # closed compose bridge on zeenie and is the whole house LAN here. With it gone, a

@@ -1,0 +1,33 @@
+# LINE ENDINGS ARE A DEPLOYMENT CONCERN HERE, NOT A STYLE PREFERENCE.
+#
+# This repository is authored on Windows and every artefact it produces runs on Linux — inside
+# the agent image, inside docker-mailserver, inside a kind pod. Without this file, git stored
+# CRLF and a shell script arrived on the mail host with `\r` on the end of its shebang. The
+# kernel then looks for an interpreter literally named "/bin/bash\r", does not find it, and the
+# script silently does not run: the mail server came up UNHARDENED, with submission accepting
+# unauthenticated senders, and nothing reported an error. Found on hp-tiger by the infra agent,
+# who had to work around it by hand.
+#
+# That failure mode is why the shell scripts are pinned explicitly rather than left to
+# `text=auto`: a config file with a stray CR usually errors loudly, while a script with one
+# fails by not existing.
+
+# Normalise everything to LF in the repository. Working-copy endings stay native.
+* text=auto
+
+# Files that CROSS THE BOUNDARY to a Linux host, checked out or copied, must be LF in the
+# working tree too — several of these are delivered by scp rather than by a git checkout, so
+# normalising only the repository would not be enough.
+*.sh          text eol=lf
+*.py          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.php         text eol=lf
+Dockerfile    text eol=lf
+*.cmd         text eol=crlf
+
+# Not text. Left alone entirely so git never rewrites a byte.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.parquet binary

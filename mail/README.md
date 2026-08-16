@@ -5,10 +5,35 @@ compose file and hardened for a LAN it now actually crosses.
 
 ```
 mail/
+├── make-certs.sh                    RUN THIS FIRST — see below
 ├── docker-compose.mail.yml          the stack
 ├── config/dms/user-patches.sh       postfix hardening, run by DMS on every start
 └── config/roundcube/custom.inc.php  Roundcube, now authenticating
 ```
+
+## Order of operations
+
+```bash
+./make-certs.sh          # idempotent; creates config/dms/ssl/{cert,key}.pem
+docker compose -f docker-compose.mail.yml up -d
+```
+
+**The certificate step is not optional and does not happen by itself.**
+`SSL_TYPE=self-signed` sounds like the server generates its own certificate; it does not.
+docker-mailserver v15 expects the files to already exist and aborts during TLS setup when they
+are missing — which is exactly how this stack failed to start the first time. The compose file
+therefore uses `SSL_TYPE=manual` with explicit `SSL_CERT_PATH`/`SSL_KEY_PATH`, so there is one
+named location and a missing file reports itself as a missing file.
+
+## A note on line endings
+
+`user-patches.sh` must reach the host with **LF** endings. A `\r` on the shebang makes the
+kernel look for an interpreter literally named `/bin/bash\r`, and the script then does not run
+— silently. The mail server comes up **unhardened**, with submission accepting unauthenticated
+senders, and nothing reports an error. The repository now pins `*.sh eol=lf` in
+`.gitattributes` so a checkout or a copy from a Windows working tree is LF either way, but it
+is worth a `file config/dms/user-patches.sh` before the first start if the files arrived by
+some other route.
 
 ## The one decision baked in: TLS is on
 
