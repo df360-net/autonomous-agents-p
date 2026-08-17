@@ -341,8 +341,13 @@ def _register_with_fleet(app, directory):
               "this way has to be registered by an operator.")
         return
 
+    # THE TAG MUST BE THE STRING CI PUBLISHES, not the commit it was built from. Those are
+    # different lengths: this used to send the full 40-char sha while CI pushed the 7-char one,
+    # which the plane faithfully deployed as a tag that does not exist — ImagePullBackOff with
+    # no error anywhere upstream, because the sha was real and every step had succeeded.
+    # agent_delivery.image_tag is the same definition the generated workflow is stamped from.
     sha = run(["git", "rev-parse", "HEAD"], cwd=directory, check=False, quiet=True)[1].strip()
-    image = f"{d.image_name(app)}:{sha}"
+    image = f"{d.image_name(app)}:{d.image_tag(sha)}"
     port = _container_port(directory)
     try:
         answer = fleet_register.register(app=d.slug(app), image=image, port=port, thread=thread)
@@ -378,7 +383,12 @@ def _container_port(directory):
     try:
         with open(manifest, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                m = re.search(r"^\s*containerPort:\s*(\d+)", line)
+                # `- containerPort: 8080` — the DASH IS NOT OPTIONAL in practice. ports is a
+                # YAML list, so every manifest written from manifest_example() has one, and the
+                # earlier pattern anchored on whitespace-then-key could not match a single real
+                # file: this returned None every time and the plane deployed on a default port.
+                # It failed the quiet way, by declining to find something rather than erroring.
+                m = re.search(r"^\s*-?\s*containerPort:\s*(\d+)", line)
                 if m:
                     return int(m.group(1))
     except OSError:
@@ -418,7 +428,9 @@ def cmd_status(app):
         print(f"{repo}: no CI run yet (the push may still be registering — try again in ~10s)")
         return 2
     status, concl = run_.get("status"), run_.get("conclusion")
-    sha = (run_.get("head_sha") or "")[:7]
+    # Same definition as the registration and the workflow: this line is quoted into manifests
+    # and emails by hand, so an independently-written [:7] here would be a third chance to drift.
+    sha = d.image_tag(run_.get("head_sha") or "")
     print(f"repo       {OWNER}/{repo}")
     print(f"run        #{run_.get('run_number')}  {run_.get('html_url')}")
     print(f"commit     {sha}")

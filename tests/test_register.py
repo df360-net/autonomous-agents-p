@@ -124,6 +124,56 @@ check("the reply's Subject matches what was promised to the control plane",
       sent["raw"].split(b"\n")[0][:80])
 check("the boss is still copied on it", b"boss@agents.local" in sent["raw"])
 
+print("\n--- the image tag names something CI actually published ---")
+# Same class of bug as the Message-ID above, and it stalled every autonomous deploy: two places
+# compute the tag, they must agree, and nothing notices when they don't. Registration sent the
+# full 40-char commit sha; CI publishes `${GITHUB_SHA::7}`. Both were internally consistent, CI
+# went green, the registration was accepted, and the sha in the failing pull was a real commit —
+# so the only symptom was a pod in ImagePullBackOff forever.
+#
+# The expected value is read out of the GENERATED WORKFLOW TEXT, not from IMAGE_TAG_LEN. Reading
+# the constant would pass even if the workflow had been edited by hand to disagree with it, which
+# is precisely the drift that caused this.
+import agent_delivery                                                       # noqa: E402
+import ship_app                                                             # noqa: E402
+
+FULL_SHA = "460beb13d637a1f2e5c8b90a4d7e6f1029384756"
+workflow = agent_delivery.ci_workflow("quotes")
+m = __import__("re").search(r"\$\{GITHUB_SHA::(\d+)\}", workflow)
+check("the generated CI workflow still stamps a truncated sha", bool(m),
+      "no ${GITHUB_SHA::N} in the workflow — if CI's tagging changed, this test must change too")
+ci_tag = FULL_SHA[:int(m.group(1))] if m else None
+check("agent_delivery.image_tag reproduces what CI publishes",
+      agent_delivery.image_tag(FULL_SHA) == ci_tag,
+      f"{agent_delivery.image_tag(FULL_SHA)} != {ci_tag}")
+check("  ...and it is a truncation, not the whole commit sha",
+      agent_delivery.image_tag(FULL_SHA) != FULL_SHA)
+
+captured = {}
+ship_app.run = lambda *a, **kw: (0, FULL_SHA + "\n")
+ship_app.fleet_register.register = lambda **kw: (captured.update(kw) or
+                                                 {"target": "hp-tiger", "status": "deploying",
+                                                  "url": "http://hp-tiger:30000"})
+APP_DIR = tempfile.mkdtemp(prefix="reg-app-")
+os.makedirs(os.path.join(APP_DIR, "k8s"))
+with open(os.path.join(APP_DIR, "k8s", "deployment.yaml"), "w", encoding="utf-8") as fh:
+    # THE REAL EXAMPLE, not hand-written YAML. The agent copies manifest_example and adapts it,
+    # so that is the only input shape worth testing — and a fixture written by hand is how the
+    # port reader passed review while being unable to parse any manifest that ever existed.
+    fh.write(agent_delivery.manifest_example("quotes", 0, container_port=3000))
+os.environ["FLEET_THREAD_MESSAGE_ID"] = "<promised@agent1>"
+ship_app._register_with_fleet("quotes", APP_DIR)
+
+check("registration sends the tag CI published, not the commit sha",
+      captured.get("image", "").endswith(":" + str(ci_tag)), captured.get("image"))
+check("  ...and the repo half of the image is unchanged",
+      captured.get("image") == f"{agent_delivery.image_name('quotes')}:{ci_tag}",
+      captured.get("image"))
+check("the port comes from the manifest the agent wrote", captured.get("port") == 3000,
+      repr(captured.get("port")))
+shutil_mod = __import__("shutil")
+shutil_mod.rmtree(APP_DIR, ignore_errors=True)
+
 print("\n--- ship_app degrades honestly when there is no task ---")
 # Running ship_app by hand from a shell is legitimate and there is no envelope then. The
 # failure to avoid is registering with an empty thread, which produces an "it's live" email

@@ -84,6 +84,29 @@ def image_name(app):
     return f"{REGISTRY}/{GITHUB_OWNER}/{repo_name(app)}"
 
 
+# The one definition of how long an image tag is. CI stamps the tag; anything that NAMES a tag
+# is quoting CI, so both sides have to derive that length from here or they will disagree.
+#
+# They did disagree, and it broke every autonomous deploy: registration sent the full 40-char
+# commit sha while CI had published the 7-char one, so the control plane pointed a Deployment at
+# a tag that does not exist and the pod sat in ImagePullBackOff until a human retagged it by
+# hand. Nothing failed loudly, because every individual step succeeded — CI went green, the
+# registration was accepted, and the sha in the failing pull was a real commit.
+IMAGE_TAG_LEN = 7
+
+
+def image_tag(sha):
+    """The tag CI will publish for commit `sha`, from the full sha.
+
+    TRUNCATED HERE, NOT BY `git rev-parse --short`. git's short sha is not fixed at 7: with the
+    default core.abbrev=auto it grows with the object count, so a repo that gets big enough
+    starts abbreviating to 8 and the caller silently goes back to naming a tag that was never
+    pushed. CI uses `${GITHUB_SHA::7}`, which is a plain string slice with no repo-dependent
+    behaviour at all, so the only way to be certain of agreeing with it is to slice the same way.
+    """
+    return (sha or "").strip()[:IMAGE_TAG_LEN]
+
+
 def ports_for(index):
     """A SUGGESTED NodePort for app-slot `index`. Nothing more, now.
 
@@ -155,9 +178,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # THE TAG THE WHOLE PIPELINE IS NAMED BY. The length is substituted from
+      # agent_delivery.IMAGE_TAG_LEN, because ship_app has to name this exact string when it
+      # registers the app for deployment and it cannot ask GitHub what was published. Changing
+      # the 7 here by hand would leave that caller pointing at a tag nobody pushed.
       - name: Compute image tag
         id: meta
-        run: echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${GITHUB_SHA::__TAGLEN__}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -182,7 +209,9 @@ jobs:
 
 
 def ci_workflow(app):
-    return CI_WORKFLOW.replace("__OWNER__", GITHUB_OWNER).replace("__REPO__", repo_name(app))
+    return (CI_WORKFLOW.replace("__OWNER__", GITHUB_OWNER)
+            .replace("__REPO__", repo_name(app))
+            .replace("__TAGLEN__", str(IMAGE_TAG_LEN)))
 
 
 # ---- The manifest: a worked example to adapt, not a form to fill ---------------------
