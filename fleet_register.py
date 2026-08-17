@@ -64,6 +64,36 @@ def register(app, image, port=None, replicas=1, thread=None):
         raise FleetError(f"register {app}: fleet unreachable: {e}")
 
 
+def report_review(app, passed, rounds=None, detail=""):
+    """Tell the plane how the review gate ruled on THIS agent's app.
+
+    Sent AFTER the gate, because until then there is no verdict to send. Registration happens
+    mid-task, while the agent is still working, so for the whole build-and-review window the
+    plane knows an app exists and does not yet know whether anyone approved it. This call is
+    what closes that window; with ANNOUNCE_REQUIRES_REVIEW on, a `fail` withholds the "it's
+    live" email that would otherwise tell the requester their rejected work is ready.
+
+    FAILS SOFT, unlike record_spend. The alternative is worse in both directions: raising here
+    would abort a task whose reply has already been sent, and no fallback "send anyway" is
+    available to us — a missing verdict holds the announcement, which is the fail-closed
+    outcome we asked for. So a failure to report costs a held announcement and a log line,
+    never a false one. Returns True when the plane accepted it.
+    """
+    body = {"verdict": "pass" if passed else "fail"}
+    if rounds is not None:
+        body["rounds"] = int(rounds)
+    if detail:
+        # The reviewer's objections can be long; the plane wants a summary, not the transcript.
+        body["detail"] = detail[:1000]
+    try:
+        _call("POST", f"/agent/apps/{app}/review", body)
+        return True
+    except urllib.error.HTTPError as e:
+        raise FleetError(f"review {app}: HTTP {e.code}: {e.read().decode()[:200]}")
+    except (urllib.error.URLError, OSError) as e:
+        raise FleetError(f"review {app}: fleet unreachable: {e}")
+
+
 def app_status(app):
     """This agent's app as the control plane sees it: {status, url, ...} or None if unknown.
     Poll this to learn when it went `deployed` and what url it resolved to."""

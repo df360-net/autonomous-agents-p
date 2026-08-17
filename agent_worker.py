@@ -29,6 +29,7 @@ import agent_peer
 import agent_principal
 import agent_validator
 import fleet_identity
+import fleet_register
 
 # ---- Config -----------------------------------------------------------------
 # The transports own their own configuration now: IMAP and the \Seen/dedupe machinery live in
@@ -401,7 +402,7 @@ def task_seq(task_id):
         return 0
 
 
-def export_thread_context(envelope):
+def export_thread_context(envelope, workspace=None):
     """Put this task's mail identity in the environment, and return the reply's Message-ID.
 
     WHY THE ENVIRONMENT AND NOT AN ARGUMENT. `ship_app` registers the app with the fleet
@@ -432,6 +433,18 @@ def export_thread_context(envelope):
             filter(None, [envelope.references, envelope.message_id])),
         "FLEET_THREAD_AGENT_ID": fleet_identity.AGENT_ID,
     })
+    # The return leg of the same problem. The worker has to tell the plane how the review ruled,
+    # and only ship_app knows which app names were actually registered — it may be none, one, or
+    # several, and the worker cannot infer them from the answer text without guessing. So
+    # ship_app appends each registered name here and the worker reads the file after the gate.
+    # A file rather than an env var because the value travels CHILD -> PARENT, which the
+    # environment cannot do.
+    if workspace:
+        os.environ["FLEET_REGISTERED_FILE"] = os.path.join(workspace, ".fleet-registered")
+    else:
+        # Unset rather than stale: a leftover path from a previous task would make this task
+        # report a verdict on someone else's app.
+        os.environ.pop("FLEET_REGISTERED_FILE", None)
     return reply_mid
 
 
@@ -574,7 +587,7 @@ def run(envelope):
     # The agent never sees these values and cannot reach them from a tool argument, which is
     # the only reason the hop limit means anything.
     agent_peer.start_task(envelope, principal)
-    reply_mid = export_thread_context(envelope)
+    reply_mid = export_thread_context(envelope, workspace)
 
     before = agent_notes.digest()
     started = time.time()          # anything newer than this in the workspace, the task made
@@ -595,6 +608,12 @@ def run(envelope):
                             f"check there before assuming the task did nothing.",
                   "steps": None, "transcript": [], "stopped": "error"}
         review = None
+
+    # Tell the plane how the gate ruled, BEFORE the reply goes out. With the announcement gate
+    # on, a `fail` withholds governance's "it's live" email — so a rejected app is never
+    # announced as finished work. Deliberately not inside the try above: a crash there must not
+    # be able to lose the reply, and this needs the verdict the gate produced.
+    report_review_to_fleet(workspace, review)
 
     # Diagnostic only — nothing depends on it, but "did it keep its own notes up to date?" is
     # the one question this whole mechanism turns on, and it should be answerable from the log.
@@ -656,6 +675,51 @@ def run(envelope):
             log(f"COULD NOT SEND REVIEW EMAIL:\n{traceback.format_exc()}")
 
 
+def registered_apps(workspace):
+    """App names ship_app registered during this task, in registration order, deduped.
+
+    Empty for the overwhelming majority of tasks — most answer a question and register nothing.
+    """
+    path = os.path.join(workspace or "", ".fleet-registered")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return list(dict.fromkeys(n.strip() for n in fh if n.strip()))
+    except OSError:
+        return []
+
+
+def report_review_to_fleet(workspace, review):
+    """POST the gate's verdict for every app this task registered.
+
+    WHY THIS IS NOT ALLOWED TO RAISE. By the time it runs, the code is pushed, the image is
+    building and the reply is about to be sent. There is no failure here worth losing a reply
+    over — and no fallback is needed, because the plane holds an un-reviewed app rather than
+    announcing it. A verdict that never arrives costs a held announcement and this log line.
+
+    NO VERDICT IS NOT A PASS. When the gate is switched off (VALIDATION_ROUNDS=0) `review` is
+    None, and nothing is sent: silence means "no one approved this", which is what the plane
+    already assumes. Reporting a pass because nobody objected is exactly the inversion the
+    announcement gate exists to prevent.
+    """
+    apps = registered_apps(workspace)
+    if not apps:
+        return
+    if review is None:
+        log(f"registered {', '.join(apps)} but the review gate did not run — reporting no "
+            "verdict, so the fleet will hold the live-address email until a human rules.")
+        return
+    detail = (review.get("notes") or "").strip()
+    for app in apps:
+        try:
+            fleet_register.report_review(app, review["passed"], review.get("rounds"), detail)
+            log(f"review verdict for {app}: {'PASS' if review['passed'] else 'FAIL'} "
+                f"reported to the fleet")
+        except Exception as e:
+            log(f"COULD NOT REPORT the review verdict for {app} ({e}). The push and the reply "
+                "are unaffected; the fleet will hold its live-address email until a human "
+                "rules on it.")
+
+
 def run_review_gate(task, result, workspace, standing=""):
     """Build -> review -> rework, until it passes or we run out of patience.
 
@@ -672,7 +736,6 @@ def run_review_gate(task, result, workspace, standing=""):
         return result, None
 
     history, review_calls = [], []
-    forced_recheck = False
     for attempt in range(1, VALIDATION_ROUNDS + 1):
         log(f"review round {attempt}/{VALIDATION_ROUNDS}")
         # The reviewer gets the standing context too — it needs the delivery rules to judge a
@@ -688,25 +751,23 @@ def run_review_gate(task, result, workspace, standing=""):
         summary = {"notes": verdict["notes"], "rounds": attempt,
                    "history": history, "transcript": review_calls}
         if verdict["passed"]:
-            # A PASS that forgives something it noticed gets looked at once more. Both measured
-            # rubber stamps had this shape: the false claim found, called "one small wording
-            # note", and passed anyway. Costs one extra review on a shape that has not yet been
-            # a correct pass, and nothing at all on a clean one — sound work has no excuse in it.
+            # DELIBERATELY NOT WIRED TO agent_validator.hedged_pass, AND THE MEASUREMENT IS WHY.
             #
-            # ONCE per task, and NO REWORK in between. Nothing was rejected, so there is nothing
-            # for the worker to fix; sending it back would invite it to edit an answer that may
-            # well be right. And a reviewer that hedges every time must not be able to burn the
-            # whole budget re-reviewing itself.
-            # `attempt < VALIDATION_ROUNDS` because a recheck needs a round to happen in. On the
-            # last one there is none, and falling out of the loop instead returns None — which
-            # the caller reads as "the gate was switched off", turning a hedged pass into an
-            # unreviewed one. The stricter-looking branch would have been the weaker outcome.
-            if (not forced_recheck and attempt < VALIDATION_ROUNDS
-                    and agent_validator.hedged_pass(verdict.get("answer", ""))):
-                forced_recheck = True
-                log("review passed but hedged — re-reviewing once before accepting")
-                history[-1]["forced_recheck"] = True
-                continue
+            # It was, briefly. The argument: a PASS that softens something it noticed is the
+            # shape both measured rubber stamps had, and a clean pass would never trip it
+            # because sound work has nothing to hedge about. The second half was wrong, and the
+            # severity ladder said so — on the clean-correct case it fired on 3 of 8 CORRECT
+            # passes. Every one was a reviewer doing its job well: noting that the transcript
+            # printed 119.16657 where its own recomputation gave 119.1715, and saying plainly
+            # that the difference does not matter. Careful review of good work produces
+            # immaterial observations, and an immaterial observation is phrased exactly like an
+            # excuse. No regex separates the two, because the difference is not in the wording.
+            #
+            # So the trade was one extra review on ~37% of all correct tasks against a benefit
+            # resting on two samples — and with the charity rule in place the knife-edge case is
+            # now rejected 8/8 without it. That is not a better gate, it is a tax on good work
+            # that looks like rigour. The predicate stays as an instrument for measuring
+            # reviewer disposition; it is not evidence that anything needs re-running.
             log(f"review PASSED on round {attempt}")
             return result, dict(summary, passed=True)
 

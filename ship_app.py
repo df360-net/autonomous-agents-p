@@ -358,6 +358,20 @@ def _register_with_fleet(app, directory):
               "deployment, and give the repo. A human can register it.")
         return
 
+    # Leave a note for the worker: it must report the review verdict on this app once the gate
+    # has run, and this is the only place that knows the name was accepted. Best-effort — a
+    # missing note holds the announcement, which is the fail-closed direction, so it must never
+    # turn a successful push into a failure.
+    marker = os.environ.get("FLEET_REGISTERED_FILE", "")
+    if marker:
+        try:
+            with open(marker, "a", encoding="utf-8") as fh:
+                fh.write(d.slug(app) + "\n")
+        except OSError as e:
+            print(f"\n(could not record {d.slug(app)} for review reporting: {e} — the "
+                  "registration itself succeeded; governance may hold the live-address email "
+                  "until a human confirms the review.)")
+
     # The URL comes back now, but the app is not serving yet — the pod does not exist until
     # the image does. So it is printed for the record and the agent is told not to hand it to
     # anyone: a URL in an email is a promise someone will click, and governance sends the real

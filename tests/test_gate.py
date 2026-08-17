@@ -145,12 +145,16 @@ for label, text, want in [
     ("a pass offering a 'small precision note' is hedged",
      "VERDICT: PASS\n\nOne small precision note for your own confidence: at 119 months the "
      "balance is $19,980.06.", True),
-    # THE CASE THAT RULED OUT THE OTHER SIGNAL. Sound work has nothing to hedge about, so a
-    # clean pass must stay silent — a tripwire that fires here would re-review every good task
-    # forever and catch nothing by doing it.
-    ("a clean pass of good work does not trip it",
+    ("a bare clean pass does not trip it",
      "VERDICT: PASS\n\nJianmin,\n\nI recomputed both figures myself and they check out. "
      "Month 120 is $20,096.61, and August is the only Friday the 13th in 2027.", False),
+    # THE CASE THAT UNWIRED IT FROM THE GATE. Taken verbatim in shape from a clean-correct run:
+    # a good reviewer noting an immaterial difference and saying so. It reads as a hedge and is
+    # not one, which is why this predicate reports on reviewers and does not gate anything.
+    ("a correct pass noting something immaterial ALSO trips it — the false positive",
+     "VERDICT: PASS\n\nAll the figures match my own to the cent. One small note: the working "
+     "line quoted 119.1666 months where my run gives 119.1715. It does not matter — both round "
+     "to the same answer.", True),
     ("a rejection is not the tripwire's business either way",
      "VERDICT: FAIL\n1. The sentence is false as written: at 11 months the balance is "
      "$10,660.71.", False),
@@ -159,21 +163,13 @@ for label, text, want in [
     print(("PASS" if got is want else "FAIL"), f" {label}")
     all_ok &= (got is want)
 
-# One recheck, then it is accepted: a reviewer that hedges every time must not burn the budget
-# re-reviewing itself, and nothing was rejected so there is nothing to rework.
+# AND THE GATE MUST NOT ACT ON IT. Measuring reviewer disposition is useful; spending a round
+# on it is not, at a 3-in-8 false-trip rate on correct work. A hedged pass costs exactly one
+# round, like any other pass — if this ever reads 2, something re-wired the tripwire.
 agent_worker.VALIDATION_ROUNDS = 3
-hedged = "VERDICT: PASS\n\nOne small wording note: that line is loose."
-# Two rounds, and the answer is STILL "original answer": the recheck is a review, not a rework.
-# Nothing was rejected, so sending it back would invite the worker to edit an answer that may
-# well be correct.
-ok, res, rev = scenario("a hedged pass is re-reviewed once, then accepted",
-                        [hedged, hedged], True, 2, "original answer")
-all_ok &= ok
-
-# And the recheck can still catch it — the entire point of spending the round.
-ok, res, rev = scenario("a hedged pass caught on the recheck is a rejection",
-                        [hedged, "VERDICT: FAIL\n1. The sentence is false as written.",
-                         "VERDICT: FAIL\n1. Still false."], False, 3, "fixed answer #1")
+ok, _, _ = scenario("a hedged pass is accepted on the first round, not re-reviewed",
+                    ["VERDICT: PASS\n\nOne small wording note: that line is loose."],
+                    True, 1, "original answer")
 all_ok &= ok
 
 

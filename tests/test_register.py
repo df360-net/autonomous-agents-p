@@ -174,6 +174,57 @@ check("the port comes from the manifest the agent wrote", captured.get("port") =
 shutil_mod = __import__("shutil")
 shutil_mod.rmtree(APP_DIR, ignore_errors=True)
 
+print("\n--- the return leg: telling the fleet how the gate ruled ---")
+# Registration happens mid-task, so for the whole build-and-review window the plane knows an
+# app exists and not whether anyone approved it. This is the call that closes that window.
+# The channel is a FILE, not the environment: the name travels child -> parent, and only
+# ship_app knows which names were accepted.
+posted = []
+agent_worker.fleet_register.report_review = lambda app, passed, rounds=None, detail="": (
+    posted.append({"app": app, "passed": passed, "rounds": rounds, "detail": detail}) or True)
+
+WS2 = tempfile.mkdtemp(prefix="reg-ws2-")
+with open(os.path.join(WS2, ".fleet-registered"), "w", encoding="utf-8") as fh:
+    fh.write("quotes\nquotes\ntodo\n")            # duplicates: two pushes of the same app
+check("registered app names are read back, in order and deduped",
+      agent_worker.registered_apps(WS2) == ["quotes", "todo"],
+      repr(agent_worker.registered_apps(WS2)))
+
+agent_worker.report_review_to_fleet(WS2, {"passed": False, "rounds": 3, "notes": "still wrong"})
+check("a rejected app is reported as a FAIL, so the fleet withholds the live email",
+      len(posted) == 2 and all(p["passed"] is False for p in posted), repr(posted))
+check("  ...with the round count and the objections",
+      posted[0]["rounds"] == 3 and posted[0]["detail"] == "still wrong", repr(posted[0]))
+
+posted.clear()
+agent_worker.report_review_to_fleet(WS2, {"passed": True, "rounds": 1, "notes": "checks out"})
+check("an approved app is reported as a PASS", [p["passed"] for p in posted] == [True, True])
+
+# THE INVERSION THE ANNOUNCEMENT GATE EXISTS TO PREVENT. Gate off means nobody approved it —
+# reporting a pass because no one objected would announce unreviewed work as reviewed.
+posted.clear()
+agent_worker.report_review_to_fleet(WS2, None)
+check("no gate means NO verdict is sent, never a pass", posted == [], repr(posted))
+
+# The common case: a task that answered a question and registered nothing must not post at all.
+posted.clear()
+WS3 = tempfile.mkdtemp(prefix="reg-ws3-")
+agent_worker.report_review_to_fleet(WS3, {"passed": True, "rounds": 1, "notes": ""})
+check("a task that registered nothing reports nothing", posted == [], repr(posted))
+
+# Fails soft: the reply is already going out, and a held announcement is the safe direction.
+def _boom(**kw):
+    raise RuntimeError("fleet unreachable")
+agent_worker.fleet_register.report_review = lambda *a, **kw: _boom()
+try:
+    agent_worker.report_review_to_fleet(WS2, {"passed": True, "rounds": 1, "notes": ""})
+    check("an unreachable fleet does not take the reply down with it", True)
+except Exception as e:
+    check("an unreachable fleet does not take the reply down with it", False, repr(e))
+shutil_mod = __import__("shutil")
+for _d in (WS2, WS3):
+    shutil_mod.rmtree(_d, ignore_errors=True)
+
 print("\n--- ship_app degrades honestly when there is no task ---")
 # Running ship_app by hand from a shell is legitimate and there is no envelope then. The
 # failure to avoid is registering with an empty thread, which produces an "it's live" email
