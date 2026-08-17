@@ -281,18 +281,36 @@ def paused():
     """
     remote, reason = fleet_control.paused()
     if remote:
+        _pause_state["reason"] = reason
         _log_pause_reason(reason)
         return True
-    return os.path.exists(PAUSE_FILE)
+    if os.path.exists(PAUSE_FILE):
+        _pause_state["reason"] = f"{PAUSE_FILE} exists — remove it to resume"
+        return True
+    _pause_state["reason"] = ""
+    return False
 
 
-_pause_reported = {"reason": None}
+_pause_state = {"reason": "", "logged": None}
+
+
+def why_paused():
+    """The reason the last `paused()` said yes, for whoever has to log it.
+
+    Exists because the caller was naming the wrong cause: agent_inbox logged
+    "FLEET-PAUSED exists" on every pause, including the ones where the file did not exist and
+    the control plane had stopped the fleet. An operator reading that goes looking for a file
+    to delete, does not find one, and concludes the log is broken — which is worse than no
+    reason at all, because now the message that explains the outage is the message that is
+    lying about it.
+    """
+    return _pause_state["reason"]
 
 
 def _log_pause_reason(reason):
     """Say why once, not every twenty seconds."""
-    if reason and _pause_reported["reason"] != reason:
-        _pause_reported["reason"] = reason
+    if reason and _pause_state["logged"] != reason:
+        _pause_state["logged"] = reason
         print(f"[budget] PAUSED: {reason}", flush=True)
 
 

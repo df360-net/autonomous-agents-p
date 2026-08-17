@@ -42,9 +42,15 @@ import urllib.request
 BASE_URL = os.environ.get("FLEET_CONTROL_URL", "").strip().rstrip("/")
 TOKEN = os.environ.get("FLEET_TOKEN", "").strip()
 # Short enough that a control-plane outage stops the fleet quickly, long enough that four
-# agents polling every 20s do not turn a settings read into a load test. Agreed with the
-# control plane's owner: an explicit pause propagates within one poll (~20s), an outage stops
-# everyone within the TTL.
+# agents polling every 20s do not turn a settings read into a load test.
+#
+# WHAT THE LATENCY ACTUALLY IS: up to this many seconds, for BOTH cases. An earlier version of
+# this comment claimed an explicit pause landed "within one poll (~20s)" and only an outage
+# waited for the TTL. That was wrong, and wrong in the direction that matters — the cache is
+# consulted BEFORE the request, so an agent holding a fresh "not paused" answer does not ask
+# again until it expires, however urgently a human is clicking pause. Both paths are bounded by
+# the TTL, not by the poll interval. Lower this if 60s is too long to wait for a stop; do not
+# tell anyone it is faster than it is.
 PAUSE_TTL = float(os.environ.get("FLEET_PAUSE_TTL", "60"))
 # Deliberately short. This call sits in front of every mail fetch, so a slow control plane
 # must not become a slow agent — and since a timeout means "paused", waiting longer only

@@ -146,8 +146,18 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     return mid
 
 
-def _re(subject):
+def reply_subject(subject):
+    """The subject a reply to `subject` will carry.
+
+    Public because something OTHER than the reply now needs to predict it: the fleet control
+    plane is told, at registration time, what subject the agent's eventual reply will have, so
+    governance's "it's live" email can thread onto it. Computing that string in two places is
+    how the follow-up ends up in its own conversation.
+    """
     return subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+
+_re = reply_subject          # the old private name, kept so existing callers do not move
 
 
 def deliver(envelope, body, attachments=None, cc=None, headers=None, message_id=None):

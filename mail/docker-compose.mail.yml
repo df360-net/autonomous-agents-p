@@ -55,6 +55,20 @@ services:
       - ENABLE_FAIL2BAN=0
       - ENABLE_CLAMAV=0
       - ENABLE_RSPAMD=0
+      # OFF because of what it does on FAILURE, not because of what it does. amavis rejects
+      # mail it judges to have a bad header — and the rejection is a bounce, so the sender's
+      # message is gone and the recipient never knew there was one. Everything it screens for
+      # here is already absent: no virus scanner, no spam filter, no external mail, a closed
+      # fleet of senders we wrote ourselves.
+      #
+      # What is NOT absent is machine-generated headers. This fleet has already lost a reply to
+      # a folded `References` header — RFC-legal, and it grows by one message-id per exchange,
+      # so it becomes fragile precisely as a conversation gets long and valuable. That was
+      # fixed in the sender, but the lesson is that our headers are assembled by code and will
+      # be malformed again. A silent bounce is the worst possible response to that: the work is
+      # already done and paid for, and the failure is invisible on both sides.
+      - ENABLE_AMAVIS=0
+      - AMAVIS_LOGLEVEL=-1
       - ENABLE_OPENDKIM=0
       - ENABLE_OPENDMARC=0
       - ENABLE_POLICYD_SPF=0

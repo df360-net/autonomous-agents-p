@@ -32,6 +32,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delivery as d
 import fleet_identity
+import fleet_register
 import git_auth
 
 API = "https://api.github.com"
@@ -133,16 +134,16 @@ def cmd_scaffold(app, directory):
     with open(os.path.join(directory, OWNER_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{fleet_identity.AGENT_ID}\n")
 
-    # TEMPORARY — REMOVE WITH THE OTHER THREE WHEN THE DEPLOY LEG LANDS. This printed the
-    # computed cluster URL "only after a human approves the release", which is the same claim
-    # already corrected in delivery_note, agent_brain and `ship_app status`. Missing it here
-    # would have been worse than not fixing any of them: scaffold is the FIRST thing an agent
-    # runs, so this line sets the expectation that the later corrections then contradict.
+    # The NodePort is still printed because the agent writes one into its manifest and the
+    # number should not come out of nowhere — but it is a suggestion now, not an allocation:
+    # the control plane assigns the real one, along with the box and the address, when the app
+    # is registered at push. No URL appears here because scaffold runs BEFORE the push, so at
+    # this point the app has no address even in principle.
     p = d.ports_for(idx)
     print(f"\napp      {d.slug(app)}\nrepo     github.com/{OWNER}/{repo}\n"
           f"image    {d.image_name(app)}\napp slot {idx}\n"
-          f"NodePort {p['node']}\nURL      none — the deployment step is offline while it is "
-          f"rebuilt; do not report a cluster URL for this app")
+          f"NodePort {p['node']} (suggested — the fleet assigns the real one)\n"
+          f"URL      assigned by the fleet at push; never computed here")
     print("\nStill yours to write: Dockerfile (must honour $PORT) and ci/test.sh.")
 
 
@@ -310,6 +311,79 @@ def cmd_push(app, directory, message=None):
     print(f"\npushed to github.com/{OWNER}/{repo}")
     print(f"actions: https://github.com/{OWNER}/{repo}/actions")
     print("CI has started. Poll it with:  ship_app status " + d.slug(app))
+    _register_with_fleet(app, directory)
+
+
+def _register_with_fleet(app, directory):
+    """Tell the control plane this app exists, immediately after the push.
+
+    REGISTERED AT PUSH TIME, WHILE CI IS STILL BUILDING THE IMAGE — deliberately, and agreed
+    with the control plane's owner. The tag names a commit that has been pushed but not yet
+    built, so for a few minutes the image genuinely is not there. The plane treats a missing
+    tag as `deploying (awaiting image)` rather than `failed`, with a grace window before it
+    gives up, so the race only delays the live email; it never reports something false.
+    Registering after CI instead would mean either polling here for minutes or asking GitHub's
+    hosted runners to reach a LAN service they cannot see.
+
+    A FAILURE HERE DOES NOT FAIL THE PUSH. The code is on GitHub and CI is running by the time
+    this is reached; exiting non-zero would tell the agent its work was lost when it was not,
+    and the agent would very reasonably push again. The registry is also the one thing here
+    that can be repaired afterwards by a human, unlike a repo pushed twice.
+    """
+    thread = {k: os.environ.get(f"FLEET_THREAD_{k.upper()}", "")
+              for k in ("requester", "subject", "message_id", "references", "agent_id")}
+    # Exported by agent_worker for the task this run belongs to. Absent when ship_app is run
+    # by hand from a shell, which is a legitimate way to use it — say so rather than sending
+    # the control plane a thread that leads nowhere.
+    if not thread["message_id"]:
+        print("\nNOT REGISTERED with the fleet: no task context in the environment "
+              "(FLEET_THREAD_*). That is normal when running ship_app by hand; an app pushed "
+              "this way has to be registered by an operator.")
+        return
+
+    sha = run(["git", "rev-parse", "HEAD"], cwd=directory, check=False, quiet=True)[1].strip()
+    image = f"{d.image_name(app)}:{sha}"
+    port = _container_port(directory)
+    try:
+        answer = fleet_register.register(app=d.slug(app), image=image, port=port, thread=thread)
+    except Exception as e:
+        print(f"\nNOT REGISTERED with the fleet ({e}).")
+        print("The push itself SUCCEEDED and CI is building — nothing is lost. Say in your "
+              "reply that the image is building but the app could not be registered for "
+              "deployment, and give the repo. A human can register it.")
+        return
+
+    # The URL comes back now, but the app is not serving yet — the pod does not exist until
+    # the image does. So it is printed for the record and the agent is told not to hand it to
+    # anyone: a URL in an email is a promise someone will click, and governance sends the real
+    # one, threaded onto this task's reply, once the pod is actually ready.
+    print(f"\nREGISTERED with the fleet control plane.")
+    print(f"  target   {answer.get('target')}")
+    print(f"  status   {answer.get('status')}")
+    print(f"  url      {answer.get('url')}   <- NOT LIVE YET. Do not put this in your reply.")
+    print("\nThe control plane deploys it when the image finishes building, then emails the "
+          "live address itself, in reply to this task. Say in your reply that the app is "
+          "built and registered and that the URL will follow — do not promise an address.")
+
+
+def _container_port(directory):
+    """The port the app listens on, read back out of the manifest the agent wrote.
+
+    Read rather than assumed: the control plane renders the Deployment from the registration,
+    so a wrong number here is an app that deploys and answers nothing. Returns None when it
+    cannot be found, which the plane treats as "not specified" — better than confidently
+    sending 8080 because that is what the example used.
+    """
+    manifest = os.path.join(directory, "k8s", "deployment.yaml")
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"^\s*containerPort:\s*(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return None
 
 
 def _write_gitignore(directory):
@@ -354,15 +428,15 @@ def cmd_status(app):
         return 3
     if concl == "success":
         print(f"image      {d.image_name(app)}:{sha}")
-        # TEMPORARY — REMOVE WHEN THE FLEET CONTROL PLANE'S DEPLOY LEG LANDS. See the matching
-        # note in agent_delivery.delivery_note. This line is what the agent READS BACK after a
-        # green build, so it is the last chance to stop "CI passed" being reported as "it is
-        # running". It has to agree with the task notes; two different stories about the same
-        # pipeline is how an agent ends up splitting the difference and inventing a third.
+        # The last thing the agent reads before composing its reply, so it is the last chance
+        # to stop "CI passed" being reported as "it is running". It has to agree with the task
+        # notes: two different stories about the same pipeline is how an agent splits the
+        # difference and invents a third.
         print("\nCI PASSED. The image is in the registry.")
-        print("It is NOT deployed, and cannot be right now: the deployment step is offline")
-        print("while it is rebuilt. There is no cluster URL for this app — do not report one.")
-        print("Say in your reply that the image is built and waiting for deployment.")
+        print("The fleet control plane deploys it from here — it was registered when you")
+        print("pushed — and emails the live address into this task's conversation once the")
+        print("pod is actually ready. That email is not yours to send and the address is not")
+        print("yours to guess: say the app is built and registered and the URL will follow.")
         return 0
     print(f"\nCI FAILED ({concl}). Read the log:  ship_app logs {d.slug(app)}")
     return 1

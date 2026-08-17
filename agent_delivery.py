@@ -6,51 +6,36 @@ dev server: it dies with the container, nothing tests it but the agent, and nobo
 it. Real delivery on this estate already exists — it was built for the calculator (see
 ../React_Typescript/github_ci_cd) — and this module teaches the agent to use it:
 
-    agent builds and tests locally on 3000-3009        <- unchanged; this is DEV
+    agent builds and tests locally                     <- this is DEV, and dies with the pod
     agent writes Dockerfile + k8s manifest + CI file
     agent pushes to github.com/<owner>/agent-<app>
     GitHub Actions (GitHub-hosted)  : test -> build -> push ghcr.io/<owner>/agent-<app>:<sha>
-    ─────────────────────────────── EVERYTHING BELOW THIS LINE IS GONE ───────────────────
-    ci-watcher pod                  : polls the Actions API -> ArtifactReady -> Kafka
-    governance pod                  : SCAN -> CR -> AWAITING_APPROVAL  <- a HUMAN approves
-                                      -> creates/【re】uses a Harness service+pipeline
-    Harness delegate                : rolling deploy into namespace `agent-apps`
-    agent-app-proxy                 : 3100N -> kind node NodePort 3000N  -> a browser URL
+    ship_app                        : REGISTERS the app with the fleet control plane
+    control plane                   : assigns the box, the NodePort and the URL
+    per-box daemon                  : renders Deployment + Service, runs the pod
+    governance                      : emails the live address into the agent's own thread
 
-THE DEPLOY LEG IS OFFLINE AS OF 2026-08-16, AND THE PIPELINE REALLY DOES STOP AT THE IMAGE.
-Kafka/redpanda were stopped and github_ci_cd's governance app was repurposed, so the four
-steps struck through above no longer run — an image is built and then nothing collects it.
+WHAT THIS FILE STOPPED DOING, WHICH IS THE INTERESTING PART. Two pipelines have now been
+retired underneath it. The first was Kafka -> ci-watcher -> approval -> Harness, which was
+switched off; for a day the chain genuinely ended at the image and the prose here said so. The
+second retirement is smaller and more useful: THE AGENT NO LONGER COMPUTES AN ADDRESS.
 
-Being replaced by a fleet control plane (registry on hp-tiger:8091, a per-box daemon, a
-reconciler), where the whole middle collapses into one call: ship_app registers the app, the
-control plane assigns the box, the NodePort and the URL, and emails the live address itself.
-The agent will stop doing port arithmetic entirely — see `ports_for` below, which is the
-thing that goes.
+It used to. `http://{APP_HOST}:{PROXY_PORT_BASE + slot}` was arithmetic over two environment
+variables, which means it produced a confident URL whether or not anything was listening on
+it — and it did exactly that, in emails, for apps nothing had deployed. Nothing errored,
+nothing was blank; the sentence was simply false. Both variables are gone from this module and
+cannot come back: the control plane allocates the port and returns the address, so there is no
+expression left here capable of inventing one.
 
-WHAT THAT MEANS FOR THIS FILE TODAY. The prose in `delivery_note` was changed to say the
-deployment step is offline and to forbid reporting a cluster URL, and the same correction is
-in agent_brain's system prompt and in ship_app's post-build output. All three are marked
-TEMPORARY and all three must be reverted together when the new leg lands — they are one
-story told in three places, and a pipeline described two different ways is how an agent ends
-up inventing a third.
+WHERE THE STORY IS TOLD, AND WHY IT IS TOLD FOUR TIMES. `delivery_note` (the task notes),
+`agent_brain`'s system prompt, `ship_app scaffold` and `ship_app status`. They must agree: an
+agent handed two accounts of the same pipeline splits the difference and invents a third, and
+`scaffold` is the FIRST thing it reads, so a stale line there outranks a correct one later.
 
-Why it was worth changing rather than waiting: the URL was pure arithmetic
-(`PROXY_PORT_BASE + slot`), so it could be produced whether or not anything was listening.
-An agent that emails a computed address for an app nothing deployed has written a plausible
-false sentence a human will act on — the exact failure the no-token branch of
-`delivery_note` was written to prevent.
-
-THE NUMBERS. Each app owns ONE index N in 0..9 and gets three ports from it:
-
-    local dev   3000 + N     published by Compose from the agent's own container
-    NodePort   30000 + N     on the kind node, inside the cluster
-    browser    31000 + N     published on Zeenie by agent-app-proxy   <- what a human opens
-
-N belongs to the APP, not the task: it must survive a redeploy, so it lives in the agent's
-own AGENT-ASSETS.md and in the committed manifest. The harness does not assign it — it has
-no view of the cluster, and inventing a second source of truth is how the `.env` that
-nothing reads got written. The agent picks the lowest N not already claimed in its notes,
-and a collision surfaces as a Kubernetes error it can then fix.
+THE ONE NUMBER LEFT. The manifest the agent commits still carries a NodePort, suggested by
+`ports_for` from the app slot in its notes. It is a plausible description of the app, not an
+allocation — the control plane assigns the real one from a range it tracks per box, which is
+why a collision is now impossible rather than merely unlikely.
 
 WHY THE CI FILE IS HARNESS-SUPPLIED AND THE MANIFEST IS NOT. The workflow is identical in
 every repo and must be exactly right — a typo there fails after the push, in a log the agent
@@ -61,13 +46,19 @@ cannot see. So it is emitted verbatim from here. The manifest genuinely differs 
 import os
 import re
 
+import fleet_identity
+
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "df360-net")
 REGISTRY = os.environ.get("REGISTRY", "ghcr.io")
 K8S_NAMESPACE = os.environ.get("K8S_NAMESPACE", "agent-apps")
-APP_HOST = os.environ.get("APP_HOST", "192.168.0.105")
 
+# APP_HOST AND PROXY_PORT_BASE ARE GONE, AND THEIR ABSENCE IS THE POINT. They were the two
+# halves of a computed URL — `http://{APP_HOST}:{PROXY_PORT_BASE + slot}` — which the agent
+# could always produce whether or not anything was listening on it. The fleet control plane
+# assigns the address now and reports it back, so there is nothing left here to compute and no
+# way for this module to invent one. NODE_PORT_BASE survives only to SUGGEST a number for the
+# manifest the agent writes; the plane allocates the real one.
 NODE_PORT_BASE = int(os.environ.get("NODE_PORT_BASE", "30000"))
-PROXY_PORT_BASE = int(os.environ.get("PROXY_PORT_BASE", "31000"))
 # How many apps can live in the cluster at once. Deliberately NOT the same number as
 # APP_PORT_COUNT, which counts local preview ports: those are capped at ten by what Compose
 # publishes from the agent's container, whereas a cluster slot costs only a NodePort (the
@@ -94,20 +85,22 @@ def image_name(app):
 
 
 def ports_for(index):
-    """The ports app-slot `index` owns — in the CLUSTER only.
+    """A SUGGESTED NodePort for app-slot `index`. Nothing more, now.
 
-    It does NOT own a local preview port. That number comes from agent_notes.free_port, which
-    picks whatever is actually free in the published range at the moment the task starts, and
-    the task notes state it. An earlier version of this function also returned `dev` =
-    3000+index, so a task could be told "listen on 3000" by the machine notes and "test on
-    3001" by the delivery note in the same message. One number, one source: the slot is about
-    where the app lands in Kubernetes, not where the agent runs it while building.
+    It used to return three things: a NodePort, a proxy port, and a URL built from them. The
+    URL is gone because the control plane assigns the address, and the proxy port is gone with
+    it — both were arithmetic this module had no business doing, since neither number was
+    checked against anything that existed.
+
+    What is left is a suggestion for the manifest the agent writes. The plane allocates the
+    real NodePort from a range it tracks per box, so a collision is now impossible rather than
+    merely unlikely; this number exists so the agent's committed manifest is a plausible
+    description of its app instead of a blank.
+
+    It does NOT own a local preview port. That comes from agent_notes.free_port, which picks
+    whatever is actually free when the task starts.
     """
-    return {
-        "node": NODE_PORT_BASE + index,
-        "proxy": PROXY_PORT_BASE + index,
-        "url": f"http://{APP_HOST}:{PROXY_PORT_BASE + index}",
-    }
+    return {"node": NODE_PORT_BASE + index}
 
 
 def index_of_node_port(node_port):
@@ -121,7 +114,7 @@ def index_of_node_port(node_port):
 # from inside the cluster (ci_watcher.py) removes the need entirely: CI stays in the cloud
 # and nothing in GitHub needs a route to the LAN.
 CI_WORKFLOW = """\
-# Built by agent1. Identical in every agent app repo — the pipeline is not the deliverable.
+# Built by an agent. Identical in every agent app repo — the pipeline is not the deliverable.
 #
 # Runs on GitHub-hosted runners only: nothing here needs LAN access. A watcher pod inside the
 # kind cluster polls this workflow's result and starts the CD half (governance -> approval ->
@@ -208,7 +201,7 @@ kind: Deployment
 metadata:
   name: {app}
   namespace: {ns}
-  labels: {{ app: {app}, managed-by: agent1 }}
+  labels: {{ app: {app}, managed-by: {managed_by} }}
 spec:
   # ONE replica by default, on purpose. Two pods do not share a filesystem, a SQLite file or
   # an in-process WebSocket hub — they are two separate copies of the application, and a user
@@ -252,7 +245,7 @@ kind: Service
 metadata:
   name: {app}
   namespace: {ns}
-  labels: {{ app: {app}, managed-by: agent1 }}
+  labels: {{ app: {app}, managed-by: {managed_by} }}
 spec:
   type: NodePort
   selector: {{ app: {app} }}
@@ -268,6 +261,9 @@ def manifest_example(app, index, container_port=8080, health="/healthz"):
         app=slug(app), ns=K8S_NAMESPACE, container_port=container_port,
         health=health, node_port=ports_for(index)["node"],
         registry=REGISTRY, owner=GITHUB_OWNER,
+        # The AGENT, not the GitHub org. `managed-by: df360-net` would be true of every app in
+        # the fleet and therefore useless; the point of the label is which agent to ask about it.
+        managed_by=fleet_identity.AGENT_ID.replace("/", "."),
     )
 
 
@@ -433,37 +429,36 @@ def claimed_indexes(assets_text):
     return found
 
 
-def slot_deployed(index, timeout=1.5):
-    """Is something actually deployed in cluster slot `index`? Asks the cluster, not the notes.
+# slot_deployed() USED TO LIVE HERE, AND ITS REMOVAL IS PART OF THE SAME CHANGE.
+#
+# It answered "is anything actually deployed in cluster slot N?" by opening a TCP connection to
+# `APP_HOST:PROXY_PORT_BASE + N` and speaking enough HTTP to see whether bytes came back. That
+# was a good check — ground truth over bookkeeping, and it correctly respected a slot claimed by
+# something the agent had not deployed itself.
+#
+# It cannot survive the control plane, for a reason worth stating rather than quietly deleting:
+# the address it probed no longer exists. There is no single host publishing a contiguous block
+# of proxy ports, because an app can now land on either box and the plane allocates its port.
+# The probe would have had to guess which box to ask, which is precisely the guessing this whole
+# migration removed.
+#
+# What replaces it is better: the plane KNOWS what is deployed and will refuse a colliding
+# allocation, so the collision this defended against cannot happen. What is lost is small and
+# should be admitted — the agent can no longer notice a slot occupied by something absent from
+# its own notes, so `suggest_index` is now pure bookkeeping. If that bites, the fix is
+# `fleet_register.app_status()`, not a socket.
 
-    A plain TCP connect is NOT enough here, unlike the local-port check in agent_notes:
-    agent-app-proxy listens on all ten of its ports whether or not anything sits behind them,
-    so every slot accepts a connection. What distinguishes them is whether any BYTES come
-    back — the proxy closes the connection unanswered when the upstream NodePort is dead.
-    So speak just enough HTTP to force a reply.
 
-    Ground truth over bookkeeping, same rule as §8: the notes say what a slot is FOR, the
-    machine says whether it is TAKEN. This is how a slot claimed by something the agent did
-    not deploy (the reference probe on slot 0) still gets respected.
+def suggest_index(assets_text, check_cluster=False):
+    """The lowest app slot this agent has not already claimed in its notes.
+
+    `check_cluster` is accepted and ignored, kept so an old caller does not break. It used to
+    trigger a live probe of the cluster; see the note above for why that is gone.
     """
-    import socket
-    try:
-        with socket.create_connection((APP_HOST, PROXY_PORT_BASE + index), timeout) as s:
-            s.settimeout(timeout)
-            s.sendall(b"GET / HTTP/1.0\r\nHost: slotcheck\r\n\r\n")
-            return bool(s.recv(1))
-    except OSError:
-        return False
-
-
-def suggest_index(assets_text, check_cluster=True):
     taken = claimed_indexes(assets_text)
     for i in range(APP_SLOTS):
-        if i in taken:
-            continue
-        if check_cluster and slot_deployed(i):
-            continue
-        return i
+        if i not in taken:
+            return i
     return None
 
 
@@ -531,23 +526,28 @@ def delivery_note(assets_text, has_token):
         # agent that offers a computed address for an app nothing deployed has written a
         # plausible sentence that is false, in an email a human will act on. Same reason the
         # no-token branch above exists at all.
-        "AFTER THAT IT IS OUT OF YOUR HANDS, AND RIGHT NOW IT STOPS THERE. The deployment "
-        "step is offline: the system that used to take a built image and run it in the "
-        "cluster is being replaced, and its replacement is not finished. CI still builds and "
-        "publishes your image, and that is real work that will be deployed once the new "
-        "pipeline lands — but nothing deploys it today.\n"
+        "AFTER THAT IT IS OUT OF YOUR HANDS, AND THAT IS THE DESIGN. `ship_app push` also "
+        "REGISTERS the app with the fleet control plane, which decides which machine runs it, "
+        "which port it gets and what its address will be. You do not choose any of those and "
+        "you cannot compute them — an agent working out its own URL is how an app gets "
+        "announced at an address nothing is listening on.\n"
         "\n"
-        "So: DO NOT GIVE ANYONE A CLUSTER URL for this app. Not as a live address, not as a "
-        "pending one. There is no address to give, and a URL in an email is a promise someone "
-        "will click. Say plainly that the image is built and waiting for deployment, which "
-        "is the honest and complete answer. The local preview URL is still worth offering, "
-        "clearly labelled as a preview that dies with this container.\n"
+        "The control plane deploys the app once CI finishes building the image, and then "
+        "EMAILS THE LIVE ADDRESS ITSELF, as a reply to the same conversation you are "
+        "answering. So the follow-up reaches the person who asked, without you.\n"
+        "\n"
+        "SO DO NOT PUT A CLUSTER URL IN YOUR REPLY. `ship_app` will print the address the "
+        "fleet assigned, and it is not live yet — the pod does not exist until the image "
+        "does. A URL in an email is a promise someone will click. Say the app is built and "
+        "registered and that the live address will follow; that is the complete and honest "
+        "answer. Your local preview URL is still worth offering, clearly labelled as a "
+        "preview that dies with this container.\n"
         "\n"
         f"Your repo will be github.com/{GITHUB_OWNER}/agent-<app-name> and your image "
         f"{REGISTRY}/{GITHUB_OWNER}/agent-<app-name>. Record in AGENT-ASSETS.md: repo, image, "
-        f"app slot {idx}, NodePort {p['node']}, and that it is BUILT BUT NOT DEPLOYED. Do not "
-        "record a URL for it — a URL in your notes is one you will repeat as fact in a later "
-        "task, long after you have forgotten it was never true.\n"
+        "and that it is registered with the fleet. Do not record a URL — the fleet owns the "
+        "address, it can change when an app moves box, and a URL in your notes is one you "
+        "will repeat as fact in a later task long after it stopped being true.\n"
         "\n"
         "--- .github/workflows/ci.yml (copy verbatim, replacing __REPO__ handling is already "
         "done for you once you know the app name) ---\n"

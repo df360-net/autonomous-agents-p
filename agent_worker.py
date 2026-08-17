@@ -49,7 +49,11 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
 VALIDATION_ROUNDS = int(os.environ.get("VALIDATION_ROUNDS", "3"))
 # Anything the agent builds that serves HTTP has to land on a port published by compose, or you
 # cannot open it. One port per task, cycling through the published range.
-APP_HOST = os.environ.get("APP_HOST", "192.168.0.105")
+# APP_HOST is gone. It named the machine a human would open a preview on, which stopped being a
+# single answerable thing once an agent became a pod that can run on either box — and stopped
+# being answerable at all while nothing publishes a pod's ports. The preview note now says
+# `localhost` and says plainly that a browser cannot reach it, which is true from inside the
+# container where the agent does its verifying. Deployed apps get their address from the fleet.
 APP_PORT_BASE = int(os.environ.get("APP_PORT_BASE", "3000"))
 APP_PORT_COUNT = int(os.environ.get("APP_PORT_COUNT", "10"))
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
@@ -170,7 +174,11 @@ def build_review_email(review, task_subject):
     """The reviewer's own sign-off. Its prose comes first — but the commands it ran are
     appended from the harness's record, so 'here is how I checked' can be checked."""
     parts = [
-        f"I reviewed agent1's reply to \"{task_subject}\" before it went out. "
+        # AGENT_NAME, not the literal "agent1". This is validator3 writing about agent3's
+        # work, and the hardcoded name made every reviewer in the fleet credit agent1 — in an
+        # email whose entire purpose is to show that the reviewer is a different identity from
+        # the worker. Invisible with one agent; wrong on three quarters of the fleet.
+        f"I reviewed {AGENT_NAME}'s reply to \"{task_subject}\" before it went out. "
         f"It passed on round {review['rounds']}.",
         "",
         review["notes"] or "(no detail given)",
@@ -393,6 +401,40 @@ def task_seq(task_id):
         return 0
 
 
+def export_thread_context(envelope):
+    """Put this task's mail identity in the environment, and return the reply's Message-ID.
+
+    WHY THE ENVIRONMENT AND NOT AN ARGUMENT. `ship_app` registers the app with the fleet
+    control plane, and the control plane needs to know which conversation to answer in when it
+    later emails "it's live". But ship_app is a SEPARATE PROCESS — the agent invokes it through
+    the shell — so it cannot see the envelope, agent_peer's task state, or anything else this
+    module holds. Environment is what a child process inherits.
+
+    THE MESSAGE-ID IS MINTED HERE, BEFORE ANYTHING IS SENT. Registration happens in the middle
+    of the task and the reply does not exist yet, so "the Message-ID of the agent's reply" is
+    not a value that can be read — it has to be decided in advance and then honoured. The same
+    trick agent_peer already uses for signing, and for the same reason: an id that is generated
+    at send time is an id nothing earlier could have referenced. `deliver()` is handed this
+    value below, so the message that eventually goes out really does carry it.
+
+    NOTE FOR WHOEVER CONSUMES THIS: the agent's shell can overwrite these variables, because
+    the agent's shell can overwrite anything in its own environment. They are a ROUTING HINT,
+    not an authorisation — fine for "which thread does this belong to", never a basis for
+    deciding who may be told what. Every message the fleet sends is copied to the boss anyway,
+    so a misdirected follow-up is visible rather than silent.
+    """
+    reply_mid = agent_outbox.new_message_id()
+    os.environ.update({
+        "FLEET_THREAD_REQUESTER": envelope.reply_to or envelope.requester or "",
+        "FLEET_THREAD_SUBJECT": agent_outbox.reply_subject(envelope.subject or "(no subject)"),
+        "FLEET_THREAD_MESSAGE_ID": reply_mid,
+        "FLEET_THREAD_REFERENCES": " ".join(
+            filter(None, [envelope.references, envelope.message_id])),
+        "FLEET_THREAD_AGENT_ID": fleet_identity.AGENT_ID,
+    })
+    return reply_mid
+
+
 def peer_note():
     """The standing paragraph about colleagues. Empty when this agent is alone in the fleet —
     an agent told it has colleagues it does not have will offer to consult them."""
@@ -505,12 +547,15 @@ def run(envelope):
         f"Your workspace for scratch work on this task is {workspace} and it is your current "
         "directory. If this task is about something you have already built, work on it where it "
         "already lives — do not copy it here.\n"
-        f"A NEW thing that serves over HTTP must listen on port {port}, which is free right now; "
-        f"its URL would be http://{APP_HOST}:{port}. But if you are changing something that is "
-        "ALREADY serving on a port, keep that port and redeploy it there — moving it breaks the "
-        f"link people already have, and ignore the {port} above. Either way: start it in the "
-        "background, curl it to confirm it answers, leave it running, and put the real URL in "
-        "your reply so it can be opened in a browser. Only ports "
+        f"A NEW thing that serves over HTTP must listen on port {port}, which is free right now. "
+        f"Verify it with `curl http://localhost:{port}` — from inside this container, which is "
+        "the only place it answers. A PREVIEW IS NOT REACHABLE FROM A BROWSER right now: this "
+        "agent runs as a pod and nothing publishes its ports outside the cluster yet. So do not "
+        "offer a preview address as something a person can open; say you tested it locally, and "
+        "let the deployed app be the thing anyone visits. But if you are changing something that "
+        "is ALREADY serving on a port, keep that port and redeploy it there — moving it breaks "
+        f"the link people already have, and ignore the {port} above. Either way: start it in the "
+        "background, curl it to confirm it answers, and leave it running. Only ports "
         f"{APP_PORT_BASE}-{APP_PORT_BASE + APP_PORT_COUNT - 1} are reachable from outside your "
         "container. Say plainly that it stays up only while the container does. If the task "
         "needs no server, ignore all of this."
@@ -529,6 +574,7 @@ def run(envelope):
     # The agent never sees these values and cannot reach them from a tool argument, which is
     # the only reason the hop limit means anything.
     agent_peer.start_task(envelope, principal)
+    reply_mid = export_thread_context(envelope)
 
     before = agent_notes.digest()
     started = time.time()          # anything newer than this in the workspace, the task made
@@ -577,10 +623,15 @@ def run(envelope):
     # an unsigned reply arriving back at agent1 is refused by its own admission check, so the
     # conversation would die silently on the return leg. The boss is copied on that leg too.
     peer_extras = agent_peer.reply_extras(envelope, principal)
+    # The id promised to the control plane at registration time must be the id that actually
+    # goes on the wire, or governance's "it's live" email threads onto a message that never
+    # existed and starts its own conversation. A peer reply mints its own — the signature
+    # covers it — and in that case the promise was never made, because registering an app is
+    # not something a peer-to-peer exchange does.
     try:
         reply_mid = agent_outbox.deliver(
             envelope, build_report(result, workspace, review, attach_note), attachments,
-            **peer_extras)
+            **{"message_id": reply_mid, **peer_extras})
     except Exception:
         log(f"COULD NOT SEND REPLY:\n{traceback.format_exc()}")
         return
@@ -678,10 +729,14 @@ def port_config_report(published=None):
             f"WARNING: APP_PORT_RANGE={published} but APP_PORT_BASE/APP_PORT_COUNT imply "
             f"{expected}. Ports outside the published range are NOT reachable from outside "
             f"this container — fix one of them in .env and recreate the container.")
+    # No browser port any more: agent_delivery.PROXY_PORT_BASE is gone, because the control
+    # plane assigns addresses and nothing here computes one. Referencing it would now be an
+    # AttributeError in the startup banner — the loudest possible place to leave a stale
+    # reference, and the reason a grep for the removed name has to include the log lines.
     lines.append(
         f"preview ports {expected} (published {published or 'unknown'}) | "
         f"cluster app slots {agent_delivery.APP_SLOTS} "
-        f"(NodePort {agent_delivery.NODE_PORT_BASE}+, browser {agent_delivery.PROXY_PORT_BASE}+)")
+        f"(NodePort {agent_delivery.NODE_PORT_BASE}+ suggested; the fleet allocates)")
     return lines
 
 

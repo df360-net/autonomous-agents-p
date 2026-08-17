@@ -205,7 +205,10 @@ def _fetch(processed, connect):
     # consumes nothing: no fetch, no \Seen, no dedupe entry. The backlog is untouched and
     # arrives in order once a human removes the file.
     if agent_budget.paused():
-        log(f"PAUSED: {agent_budget.PAUSE_FILE} exists — not fetching mail. Remove it to resume.")
+        # Ask WHY rather than asserting it. This line used to name the pause file
+        # unconditionally, which was correct until the kill switch moved to the control plane
+        # and then sent every operator hunting for a file that was not there.
+        log(f"PAUSED: {agent_budget.why_paused()} — not fetching mail.")
         return []
     imap = connect()
     fresh = []
