@@ -101,6 +101,39 @@ p, n = agent_validator.parse_verdict("I think it's probably fine?")
 print(("PASS" if p is False else "FAIL"), " vague reviewer cannot wave work through")
 all_ok &= p is False
 
+# ---- verdicts as the reviewer really writes them -----------------------------
+# Every fixture above puts VERDICT: at position 0, which is what the prompt demands. Measured
+# over twelve live runs it obeyed that once: eleven wrote reasoning first and ruled part-way
+# down, one of them 6,181 characters in. So the shape these tests were built on is the rare
+# one, and the parser has to be judged on the common one.
+p, n = agent_validator.parse_verdict(
+    "Verified both calculations against my own commands.\n\nVERDICT: PASS\n\nJianmin,\n\nBoth "
+    "figures check out.")
+print(("PASS" if p is True and n.startswith("Jianmin") else "FAIL"),
+      " a verdict after a preamble is still read, and the notes start after it", "" if p else n)
+all_ok &= (p is True and n.startswith("Jianmin"))
+
+# THE FAIL-OPEN THIS CLOSES. Prose before the verdict is normal, so a reviewer weighing a pass
+# aloud before settling on FAIL is a reachable shape — and reading the FIRST match off it sent
+# the work out as approved.
+p, n = agent_validator.parse_verdict(
+    "My first instinct was VERDICT: PASS, but substituting the answer back shows it is short.\n"
+    "VERDICT: FAIL\n1. At 119 months the balance is $19,980.06.")
+print(("PASS" if p is False else "FAIL"),
+      " a pass considered aloud before a FAIL cannot be read as the ruling")
+all_ok &= p is False
+
+# Contradiction is a rejection, and the agent must still be able to see what was said.
+p, n = agent_validator.parse_verdict("VERDICT: PASS\nlooks fine\n\nVERDICT: FAIL\non reflection, no")
+print(("PASS" if p is False and "FAIL" in n else "FAIL"),
+      " contradictory verdicts are refused, with the text preserved")
+all_ok &= (p is False and "FAIL" in n)
+
+# Unanimity is not pedantry: a reviewer that says PASS twice has still only passed it once.
+p, n = agent_validator.parse_verdict("VERDICT: PASS\n\nsign-off\n\nRestating: VERDICT: PASS")
+print(("PASS" if p is True else "FAIL"), " a pass restated is still a pass")
+all_ok &= p is True
+
 
 # ---- the reviewer's own email ------------------------------------------------
 agent_worker.VALIDATION_ROUNDS = 3

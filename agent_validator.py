@@ -142,6 +142,14 @@ VALIDATOR_PROMPT = (
     "NOT fail it for style, tone, formatting, or for not doing things nobody asked for. If the "
     "work is right, say so and pass it — blocking good work is also a failure.\n"
     "\n"
+    "WHEN THOSE TWO RULES COLLIDE, THE DEFECT WINS. A false statement of fact is never a "
+    "wording problem, however small it looks and however good the rest of the work is. If the "
+    "reply says it checked something and your own commands show that check does not hold, that "
+    "is a claim the evidence does not support — FAIL it, even where the headline answer happens "
+    "to be right and the sentence reads like a slip of the pen. Recording it as a note and "
+    "passing anyway is the one outcome that must not happen: the reply is then sent verbatim, "
+    "with the false sentence still in it, and your note is read by nobody.\n"
+    "\n"
     "Your final answer MUST begin with exactly one of these two lines:\n"
     "VERDICT: PASS\n"
     "VERDICT: FAIL\n"
@@ -215,13 +223,35 @@ def build_review_task(task, result, workspace):
 
 def parse_verdict(answer):
     """Anything we cannot read as a clear PASS is a FAIL. A reviewer that rambles instead of
-    ruling must not be able to wave work through by being vague."""
-    m = re.search(r"VERDICT:\s*(PASS|FAIL)", answer or "", re.IGNORECASE)
-    if not m:
+    ruling must not be able to wave work through by being vague.
+
+    EVERY occurrence has to say PASS, not just the first one. The prompt demands the answer
+    BEGIN with the verdict line; measured over twelve live runs it did so once. The other
+    eleven wrote reasoning first and ruled part-way down — one of them 6,181 characters in.
+    So prose before the verdict is the normal case, not the exception, and `search` taking the
+    first match meant a reviewer who weighed "VERDICT: PASS" aloud before settling on FAIL
+    would have had the wrong ruling read off it. Requiring unanimity makes position irrelevant:
+    a genuine PASS says PASS everywhere it says anything, and any disagreement is a reviewer
+    that did not actually rule, which is the case this function exists to refuse.
+    """
+    verdicts = [v.upper() for v in
+                re.findall(r"VERDICT:\s*(PASS|FAIL)", answer or "", re.IGNORECASE)]
+    if not verdicts:
         return False, "The reviewer did not return a parseable verdict:\n\n" + (answer or "")
-    if m.group(1).upper() == "PASS":
-        return True, (answer or "")[m.end():].strip()
-    return False, (answer or "")[m.end():].strip()
+    # Notes run from the LAST verdict line: everything before it is deliberation, and on a PASS
+    # what follows is emailed to the requester as the sign-off. Cutting at the first line would
+    # paste the reviewer's own thinking-aloud into that email.
+    last = list(re.finditer(r"VERDICT:\s*(PASS|FAIL)", answer or "", re.IGNORECASE))[-1]
+    notes = (answer or "")[last.end():].strip()
+    if any(v == "FAIL" for v in verdicts):
+        if "PASS" in verdicts:
+            # Contradiction, so it is a FAIL — but say which text was rejected, or the agent is
+            # asked to fix something with no way to see what the reviewer actually concluded.
+            return False, ("The reviewer gave contradictory verdicts "
+                           f"({', '.join(verdicts)}) and is treated as a rejection:\n\n"
+                           + (answer or ""))
+        return False, notes
+    return True, notes
 
 
 def review(task, result, workspace, on_event=None, standing=""):
