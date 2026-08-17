@@ -542,19 +542,17 @@ def delivery_note(assets_text, has_token):
         "Do not report success until `ship_app status` actually says success. If it fails, "
         "read the log, fix it, and push again — a red build is not delivery.\n"
         "\n"
-        # TEMPORARY — REMOVE WHEN THE FLEET CONTROL PLANE'S DEPLOY LEG LANDS.
-        # The chain this paragraph used to describe (approve in the dashboard, Harness rolls
-        # it out, answer at a computed URL) no longer exists: Kafka/ci-watcher/Harness were
-        # retired and the app that drove them was repurposed. The replacement — register with
-        # the fleet control plane, which assigns the box, the NodePort and the URL, and emails
-        # the live address itself — is being built. Until it does, the pipeline genuinely
-        # stops at the image, and the agent must be told so.
+        # The deploy leg has LANDED: the plane assigns the box, port and address, deploys when
+        # the image finishes, and emails the live URL into this task's thread. The paragraph
+        # that used to say the pipeline stopped at the image is gone with it.
         #
-        # Saying nothing was not an option. The URL was arithmetic, `PROXY_PORT_BASE + slot`,
-        # so it could always be produced whether or not anything was listening on it — and an
-        # agent that offers a computed address for an app nothing deployed has written a
-        # plausible sentence that is false, in an email a human will act on. Same reason the
-        # no-token branch above exists at all.
+        # EXACTLY ONE NARRATOR EACH, and that is what the text below is arranging. The agent
+        # reports what it did — built, tested, pushed, registered. Governance reports what it
+        # observed — the address, once a pod is actually serving on it. Neither can report the
+        # other's half honestly: the agent cannot know the app is live, and the plane cannot
+        # know what the agent was trying to build. The old wording had the agent computing
+        # `PROXY_PORT_BASE + slot`, which produced a confident address whether or not anything
+        # was listening — the failure this split exists to make impossible.
         "AFTER THAT IT IS OUT OF YOUR HANDS, AND THAT IS THE DESIGN. `ship_app push` also "
         "REGISTERS the app with the fleet control plane, which decides which machine runs it, "
         "which port it gets and what its address will be. You do not choose any of those and "

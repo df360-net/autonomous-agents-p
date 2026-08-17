@@ -142,6 +142,13 @@ VALIDATOR_PROMPT = (
     "NOT fail it for style, tone, formatting, or for not doing things nobody asked for. If the "
     "work is right, say so and pass it — blocking good work is also a failure.\n"
     "\n"
+    "JUDGE THE TEXT AS WRITTEN. DO NOT SUBSTITUTE WHAT THE AUTHOR MEANT. If a sentence is "
+    "wrong as it stands, it is wrong — you may not repair it into a sensible one and then "
+    "grade the repair. When a reply states a figure that contradicts its own transcript, the "
+    "question is not 'what did they probably mean here', it is 'is this sentence true'. The "
+    "recipient never sees your reconstruction; they see the sentence. Read it the way they "
+    "will, with no knowledge of the working behind it.\n"
+    "\n"
     "WHEN THOSE TWO RULES COLLIDE, THE DEFECT WINS. A false statement of fact is never a "
     "wording problem, however small it looks and however good the rest of the work is. If the "
     "reply says it checked something and your own commands show that check does not hold, that "
@@ -254,6 +261,35 @@ def parse_verdict(answer):
     return True, notes
 
 
+# Words a reviewer reaches for when it has FOUND something and decided to forgive it. Not a
+# judgement of the work — a marker of the reviewer's own disposition toward a discrepancy it
+# has already noticed.
+_HEDGE = re.compile(
+    r"\b(small (wording|precision) note|small note|wording|loose\b|nit\b|minor\b|slight\b"
+    r"|imprecise|for your own confidence)\b", re.IGNORECASE)
+
+
+def hedged_pass(answer):
+    """True when a PASS is carrying an excuse — the shape both measured rubber stamps had.
+
+    Over twelve live runs against the known-bad fixture, both misses passed the work while
+    calling the false sentence "one small wording note" and "one small precision note for your
+    own confidence". Neither used defect vocabulary anywhere; all ten rejections did.
+
+    WHY THIS AND NOT THE STRICT-VOCABULARY SIGNAL. That one separates the same twelve runs
+    perfectly, but it fires as "a PASS that never names a defect" — which is exactly what a
+    correct pass of genuinely good work looks like. It would trip on every clean task forever,
+    doubling the review cost of all good work while catching nothing there. Hedging is the
+    better half of the same signal: sound work has nothing to hedge about, so silence on a
+    clean pass stays silent. Both measured misses hedge; a clean pass does not.
+
+    It is a DISPOSITION MARKER, not a proof, and it is brittle to paraphrase — a reviewer that
+    forgives a false claim without a softening word sails through. It buys one cheap re-review
+    on a shape that has never yet been a correct pass, and it is worth exactly that much.
+    """
+    return bool(_HEDGE.search(answer or ""))
+
+
 def review(task, result, workspace, on_event=None, standing=""):
     """Returns {"passed": bool, "notes": str, "steps": int, "transcript": [...]}
 
@@ -275,8 +311,11 @@ def review(task, result, workspace, on_event=None, standing=""):
         return {"passed": False, "notes": f"The review could not run: {review_result['answer']}",
                 "steps": review_result["steps"], "transcript": review_result["transcript"]}
     passed, notes = parse_verdict(review_result["answer"])
-    return {"passed": passed, "notes": notes, "steps": review_result["steps"],
-            "transcript": review_result["transcript"]}
+    # `answer` is the WHOLE ruling, deliberation included. notes is cut at the verdict line, so
+    # a reviewer that talks itself into forgiving something before ruling would have that part
+    # dropped before hedged_pass ever saw it.
+    return {"passed": passed, "notes": notes, "answer": review_result["answer"],
+            "steps": review_result["steps"], "transcript": review_result["transcript"]}
 
 
 REWORK_TEMPLATE = (

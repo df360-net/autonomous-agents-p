@@ -628,10 +628,19 @@ def run(envelope):
     # existed and starts its own conversation. A peer reply mints its own — the signature
     # covers it — and in that case the promise was never made, because registering an app is
     # not something a peer-to-peer exchange does.
+    # A reply that exhausted the rounds still goes out — never drop a task a human asked for —
+    # but until now that fact lived only in the body, where nothing but a human reading it can
+    # act on it. The subject cannot carry it: it was promised to the control plane at
+    # registration time and governance threads its follow-up onto that exact string. A header
+    # is the channel that stays machine-readable without breaking a promise already made.
+    review_headers = {}
+    if review and not review["passed"]:
+        review_headers["X-Agent-Review"] = f"NOT-PASSED after {review['rounds']} round(s)"
     try:
         reply_mid = agent_outbox.deliver(
             envelope, build_report(result, workspace, review, attach_note), attachments,
-            **{"message_id": reply_mid, **peer_extras})
+            **{"message_id": reply_mid, **peer_extras,
+               "headers": {**peer_extras.get("headers", {}), **review_headers}})
     except Exception:
         log(f"COULD NOT SEND REPLY:\n{traceback.format_exc()}")
         return
@@ -663,6 +672,7 @@ def run_review_gate(task, result, workspace, standing=""):
         return result, None
 
     history, review_calls = [], []
+    forced_recheck = False
     for attempt in range(1, VALIDATION_ROUNDS + 1):
         log(f"review round {attempt}/{VALIDATION_ROUNDS}")
         # The reviewer gets the standing context too — it needs the delivery rules to judge a
@@ -678,6 +688,25 @@ def run_review_gate(task, result, workspace, standing=""):
         summary = {"notes": verdict["notes"], "rounds": attempt,
                    "history": history, "transcript": review_calls}
         if verdict["passed"]:
+            # A PASS that forgives something it noticed gets looked at once more. Both measured
+            # rubber stamps had this shape: the false claim found, called "one small wording
+            # note", and passed anyway. Costs one extra review on a shape that has not yet been
+            # a correct pass, and nothing at all on a clean one — sound work has no excuse in it.
+            #
+            # ONCE per task, and NO REWORK in between. Nothing was rejected, so there is nothing
+            # for the worker to fix; sending it back would invite it to edit an answer that may
+            # well be right. And a reviewer that hedges every time must not be able to burn the
+            # whole budget re-reviewing itself.
+            # `attempt < VALIDATION_ROUNDS` because a recheck needs a round to happen in. On the
+            # last one there is none, and falling out of the loop instead returns None — which
+            # the caller reads as "the gate was switched off", turning a hedged pass into an
+            # unreviewed one. The stricter-looking branch would have been the weaker outcome.
+            if (not forced_recheck and attempt < VALIDATION_ROUNDS
+                    and agent_validator.hedged_pass(verdict.get("answer", ""))):
+                forced_recheck = True
+                log("review passed but hedged — re-reviewing once before accepting")
+                history[-1]["forced_recheck"] = True
+                continue
             log(f"review PASSED on round {attempt}")
             return result, dict(summary, passed=True)
 
