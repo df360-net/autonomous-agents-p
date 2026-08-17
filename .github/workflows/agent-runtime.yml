@@ -64,13 +64,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute the short tag
+        id: tag
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          # BOTH SHA FORMS, DELIBERATELY. This image is declared by a human pasting a tag out of
+          # a relayed message, and the app images built by agents are tagged with the 7-char sha
+          # — so the two conventions differ and a reader who has just learned "short is correct"
+          # will reasonably truncate one of these by hand. Publishing both means that guess
+          # resolves instead of producing an ImagePullBackOff on a tag nobody pushed, which is
+          # exactly the failure this fleet just spent a deploy cycle on.
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.short }}
             ${{ env.IMAGE }}:main
           # Layer cache in the registry: the apt+node layer is the expensive one and it
           # changes far less often than the Python sources copied above it.
