@@ -197,6 +197,12 @@ for n in (".spend.jsonl", "FLEET-PAUSED", ".processed.json"):
     with open(os.path.join(ROOT, n), "w") as fh:
         fh.write("harness state")
 
+# This one is different, and worse. ship_app writes it INSIDE the task workspace, so it is
+# fresh, small and non-empty on precisely the tasks that produce a real deliverable — it would
+# have been attached alongside the app somebody asked for, not on quiet runs where nobody looks.
+with open(os.path.join(ROOT, "task-0022-expense-tracker", ".fleet-registered"), "w") as fh:
+    fh.write("expense-tracker\n")
+
 files, note = agent_worker.collect_attachments(ROOT, started)
 names = [n for n, _ in files]
 check("a file corrected in an earlier task's folder IS attached", names == ["book.txt"],
@@ -204,6 +210,8 @@ check("a file corrected in an earlier task's folder IS attached", names == ["boo
 check("the spend ledger is never mailed to anyone", ".spend.jsonl" not in names, f"got {names}")
 check("nor the pause file or the dedupe state",
       not ({"FLEET-PAUSED", ".processed.json"} & set(names)), f"got {names}")
+check("the fleet registration marker is not mailed with the app it belongs to",
+      ".fleet-registered" not in names, f"got {names}")
 check("the agent's own notes are not mailed back",
       not any(n.startswith("AGENT") for n in names), f"got {names}")
 check("a live app's database is never attached", "expenses.db" not in names, f"got {names}")

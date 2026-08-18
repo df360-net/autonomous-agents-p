@@ -220,7 +220,11 @@ ATTACH_SKIP_NAMES = {"AGENT.md", "AGENT-ASSETS.md", "AGENT-AVOID.md", ".processe
                      # Harness state that lives in the scan root and is written on every run.
                      # The ledger gets a line per LLM call, so without this every single reply
                      # would arrive with the agent's spend history stapled to it.
-                     ".spend.jsonl", "FLEET-PAUSED", "budget.json"}
+                     ".spend.jsonl", "FLEET-PAUSED", "budget.json",
+                     # Written by ship_app INSIDE the task workspace, so unlike the others it is
+                     # fresh, small and non-empty on exactly the tasks that produce a real
+                     # deliverable — it would have ridden along with the app someone asked for.
+                     ".fleet-registered"}
 # Live application data, not deliverables. Apps built by earlier tasks keep serving inside this
 # container, so a request arriving mid-run touches their database — and an expense tracker's
 # sqlite file must never be posted to anyone because the timestamp made it look fresh.
