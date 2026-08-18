@@ -174,6 +174,32 @@ check("the port comes from the manifest the agent wrote", captured.get("port") =
 shutil_mod = __import__("shutil")
 shutil_mod.rmtree(APP_DIR, ignore_errors=True)
 
+print("\n--- the generated artefacts agree on one port ---")
+# The first production build served a dead link: ci/test.sh curled 3217, the server defaulted
+# to 3000, the manifest declared 8080. Nothing here can force an agent to write a correct
+# test, but the two things the harness DOES generate must not be the source of the confusion,
+# and the guidance must name the failure rather than merely ask for consistency — "connection
+# refused" reads like a crashed server, which is where that build's time went.
+man = agent_delivery.manifest_example("quotes", 0, container_port=8080)
+# Only the ones that NAME THE CONTAINER'S PORT. A Service legitimately publishes 80 and a
+# NodePort 30000+; those are different numbers on purpose and demanding they match would be
+# the same confusion in the other direction.
+re_ = __import__("re")
+container_ports = sorted(set(int(p) for p in re_.findall(
+    r"(?:containerPort|targetPort|port:\s*)(\d+)", man.replace("port: 80\n", ""))))
+check("containerPort, targetPort and both probes name one port",
+      container_ports == [8080], repr(container_ports))
+check("  ...and the Service still publishes 80 -> that port, which is not a mismatch",
+      "port: 80" in man and "targetPort: 8080" in man)
+check("  ...and PORT is set from it, since the server must read it from there",
+      'value: "8080"' in man, repr([l for l in man.splitlines() if "PORT" in l]))
+
+note = agent_delivery.delivery_note("", has_token=True)
+check("the delivery note tells the agent to read one port from $PORT",
+      "${PORT:-8080}" in note and "$PORT" in note)
+check("  ...and says what the failure looks like, not just what to do",
+      "connection refused" in note.lower())
+
 print("\n--- the return leg: telling the fleet how the gate ruled ---")
 # Registration happens mid-task, so for the whole build-and-review window the plane knows an
 # app exists and not whether anyone approved it. This is the call that closes that window.

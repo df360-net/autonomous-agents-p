@@ -254,6 +254,11 @@ spec:
           image: {registry}/{owner}/agent-{app}:<the-sha-from-ship_app-status>
           ports:
             - containerPort: {container_port}
+          # THE ONE NUMBER THAT MATTERS IN THIS FILE. The control plane reads containerPort out
+          # of here when you register, renders the real Deployment itself, and sets PORT to
+          # this value in the running container. So your server must take its port from $PORT
+          # and this number must be the port it actually serves — get them out of step and the
+          # pod goes Ready while answering nothing, which looks like a broken app and is not.
           env:
             - name: PORT
               value: "{container_port}"
@@ -520,10 +525,23 @@ def delivery_note(assets_text, has_token):
         "  1. Build and test it locally first, on the port the machine notes above gave you. "
         "Do not skip this — it is much cheaper to find a bug here than after a build.\n"
         f"  2. Write a Dockerfile that runs it. It must listen on the port given by the PORT "
-        "environment variable, because Kubernetes sets that, not you.\n"
+        "environment variable, because the platform sets that, not you.\n"
         "  3. Write ci/test.sh — the command that proves it works, exiting non-zero on "
         "failure. CI runs it before building anything. A repo with no ci/test.sh ships "
         "untested and says so in the build log.\n"
+        "\n"
+        "     ONE PORT, READ FROM ONE PLACE. If ci/test.sh starts your server and then curls "
+        "it, both halves must use the SAME port, and the way to guarantee that is to set it "
+        "once at the top and let everything read it:\n"
+        "         PORT=\"${PORT:-8080}\"; export PORT\n"
+        "         node server.js & SERVER=$!\n"
+        "         trap 'kill $SERVER' EXIT\n"
+        "         curl -fsS \"http://localhost:$PORT/healthz\"\n"
+        "     A literal port number written into the curl line is the bug to avoid: your "
+        "server takes its port from $PORT, so the moment the two disagree the test fails "
+        "against a port nothing is listening on, and the error it prints — connection refused "
+        "— reads exactly like a server that crashed on startup. That has already cost one "
+        "build a long detour into debugging a server that was working perfectly.\n"
         f"  4. Write k8s/deployment.yaml. Your app slot is {idx}, so your NodePort is "
         f"{p['node']} — that number must not collide with an app already in your notes.\n"
         "\n"
