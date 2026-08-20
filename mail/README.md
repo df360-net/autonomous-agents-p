@@ -1,113 +1,77 @@
-# The fleet mail server, for hp-tiger
+# The fleet mail server — WHY it is configured as it is
 
-Hand this directory to whoever hosts the box. It is the mail stack lifted out of the agents'
-compose file and hardened for a LAN it now actually crosses.
+**The configuration itself lives in `infra-fleet/mail/` and auto-deploys on push. It is not
+here any more, and it must not be edited here.**
 
-```
-mail/
-├── make-certs.sh                    RUN THIS FIRST — see below
-├── docker-compose.mail.yml          the stack
-├── config/dms/user-patches.sh       postfix hardening, run by DMS on every start
-└── config/roundcube/custom.inc.php  Roundcube, now authenticating
-```
+This directory held a working copy of the mail stack while it was being stood up on hp-tiger.
+That stack is now under CD: compose, the DMS `user-patches.sh` and the Roundcube config are
+version-controlled upstream and deployed from there. Keeping a second copy in this repo would
+have meant two sources for one live config — the exact shape of bug this project has now fixed
+three times (the image tag computed in two places, the reply subject computed in two places,
+the port declared in three). A hand-edit here would be reverted by the next deploy, or worse,
+would diverge quietly and be believed.
 
-## Order of operations
+**What remains here is the reasoning**, because the settings below are all ones a reasonable
+person would "fix" back, and the reasons do not survive in the file itself. If you need a mail
+change, it is a PR to `infra-fleet/mail/`.
 
-```bash
-./make-certs.sh          # idempotent; creates config/dms/ssl/{cert,key}.pem
-docker compose -f docker-compose.mail.yml up -d
-```
+## What the agents depend on, and must not change without them
 
-**The certificate step is not optional and does not happen by itself.**
-`SSL_TYPE=self-signed` sounds like the server generates its own certificate; it does not.
-docker-mailserver v15 expects the files to already exist and aborts during TLS setup when they
-are missing — which is exactly how this stack failed to start the first time. The compose file
-therefore uses `SSL_TYPE=manual` with explicit `SSL_CERT_PATH`/`SSL_KEY_PATH`, so there is one
-named location and a missing file reports itself as a missing file.
-
-## A note on line endings
-
-`user-patches.sh` must reach the host with **LF** endings. A `\r` on the shebang makes the
-kernel look for an interpreter literally named `/bin/bash\r`, and the script then does not run
-— silently. The mail server comes up **unhardened**, with submission accepting unauthenticated
-senders, and nothing reports an error. The repository now pins `*.sh eol=lf` in
-`.gitattributes` so a checkout or a copy from a Windows working tree is LF either way, but it
-is worth a `file config/dms/user-patches.sh` before the first start if the files arrived by
-some other route.
-
-## The one decision baked in: TLS is on
-
-The ask was "enable SMTP AUTH so `:25` stops being an open relay". **SMTP AUTH is not a flag
-that can be turned on by itself.** Postfix will not advertise an AUTH mechanism over an
-unencrypted connection — that is precisely why the current Roundcube config sends
-unauthenticated, and the comment saying so has been in the repo the whole time.
-
-So enabling AUTH without TLS produces a server that offers no way to authenticate and clients
-that quietly relay instead. `SSL_TYPE=self-signed` is what makes the rest real.
-
-Self-signed, because `agents.local` exists in no public DNS and never will. The value is that
-**mailbox passwords stop crossing the LAN in clear** once four agents on two boxes are
-authenticating over the wire — not that it proves the server's identity. The agents already
-expect this: `TLS_VERIFY` defaults to `false` in both `agent_inbox` and `agent_outbox`, added
-originally for exactly this case.
-
-> **Do not set `TLS_VERIFY=true` on the agents** without first giving this server a
-> certificate they can chain to. Every agent stops receiving mail at once, and the symptom is
-> a login failure that reads like a wrong password.
-
-## What changed, and what breaks if it is undone
-
-| Change | Why | If reverted |
+| Setting | Why | If reverted |
 |---|---|---|
-| `PERMIT_DOCKER` removed | it trusted "connected networks", which was a private bridge on zeenie and is the whole house LAN here | `:25` is an open relay again — anything on the LAN can task an agent and spend its budget |
-| `SSL_TYPE=self-signed` | without it there is no AUTH to enable | AUTH silently unavailable; clients fall back to relaying |
-| submission on `:587`, `permit_sasl_authenticated,reject` | a client that simply offers no credentials would otherwise be accepted | `:587` becomes another `:25` |
-| plaintext-auth patch **deleted** | TLS exists now, so credentials go inside STARTTLS | passwords cross the LAN in clear |
+| `PERMIT_DOCKER` absent | it trusts "connected networks" — a private bridge on zeenie, the whole house LAN on hp-tiger | `:25` is an open relay: anything on the LAN can task an agent and spend its budget |
+| `SSL_TYPE=manual` + explicit cert paths | `self-signed` sounds like the server makes one and does not; DMS v15 aborts inside TLS setup when the files are missing. This is how the stack failed to start the first time | fails during TLS setup instead of reporting a missing file |
+| submission on `:587`, `permit_sasl_authenticated,reject` | a client offering no credentials would otherwise be accepted | `:587` becomes another `:25` |
+| `ENABLE_AMAVIS=0` | not for what it screens — no virus scanner, no spam filter, no external mail — but for **how it fails**: a rejection is a bounce, so the sender's message is gone and the recipient never knew there was one. Our headers are assembled by code and have already lost one reply to a folded `References` header | silent bounces on machine-generated mail, invisible on both sides |
+| plaintext-auth patch deleted | TLS exists now, so credentials go inside STARTTLS | passwords cross the LAN in clear |
+
+> **Do not set `TLS_VERIFY=true` on the agents** without first giving the server a certificate
+> they can chain to. `agent_inbox` and `agent_outbox` both default it to `false` for exactly
+> this reason. Every agent stops receiving mail at once, and the symptom is a login failure
+> that reads like a wrong password.
+
+### `user-patches.sh` must reach the box with LF endings
+
+A `\r` on the shebang makes the kernel look for an interpreter named `/bin/bash\r`, and the
+script then does not run — **silently**. The mail server comes up unhardened, submission
+accepts unauthenticated senders, and nothing reports an error. `.gitattributes` pins
+`*.sh eol=lf` here; whoever owns that file upstream needs the same pin, because the failure is
+invisible rather than loud.
 
 ## SPOOF_PROTECTION is off, deliberately
 
-Turning it on makes Postfix reject a `MAIL FROM` that does not match the authenticated login.
-**Each agent legitimately sends as two identities**: itself, and its reviewer
-(`validator1@agents.local`), which is what makes a sign-off visibly not the worker grading its
-own homework. One credential, two From addresses — so enabling it would break every reviewer
-email the moment it was switched on.
+It rejects a `MAIL FROM` that does not match the authenticated login. **Each agent legitimately
+sends as two identities**: itself, and its reviewer (`validator1@agents.local`) — which is what
+makes a sign-off visibly not the worker grading its own homework. One credential, two From
+addresses, so turning it on breaks every reviewer email immediately.
 
-The residual risk is that one authenticated agent could send mail claiming to be another. That
-is already handled where it counts: agent-to-agent decisions are made on an HMAC signature and
-never on the `From` header, and `agent_principal` **refuses** unsigned mail that claims to come
-from a fleet mailbox. Spoofing the header buys nothing.
+The residual risk is an authenticated agent sending as another. That is handled where it
+counts: agent-to-agent decisions are made on an HMAC signature, never on `From`, and
+`agent_principal` refuses unsigned mail claiming to come from a fleet mailbox. Spoofing the
+header buys nothing.
 
-**The clean fix, when we want it:** give each validator its own mailbox and credential, so
-every identity authenticates as itself and `SPOOF_PROTECTION=1` can go on with no exceptions.
-That needs a small change in `agent_outbox` to select credentials by `from_addr`, plus four
-more mailboxes. Worth doing; not worth blocking the move.
+**The clean fix, when wanted:** a mailbox and credential per validator, so every identity
+authenticates as itself. That needs a change in `agent_outbox` to select credentials by
+`from_addr`, plus four more mailboxes — the agent-side half is mine, the mail-side half is a PR
+to `infra-fleet/mail/`.
 
-## Accounts to create
+## Mailbox provisioning is still here, and still host-only
 
-Use `provision_agent.py` (in the repo root) on this box — it creates the mailbox and prints a
-k8s Secret on stdout, so the password never lands in a file:
+`provision_agent.py` (repo root) creates the mailbox and prints a k8s Secret on stdout, so the
+password never lands in a file. It writes `postfix-accounts.cf`, which is deliberately
+gitignored and **not** CD-managed — creating mailboxes is unaffected by the move.
 
 ```bash
 python3 provision_agent.py agent1 | kubectl --context <box> -n fleet apply -f -
-python3 provision_agent.py agent2 | kubectl --context <box> -n fleet apply -f -
-python3 provision_agent.py agent3 | kubectl --context <box> -n fleet apply -f -
-python3 provision_agent.py agent4 | kubectl --context <box> -n fleet apply -f -
-python3 provision_agent.py fleet  | kubectl --context <box> -n fleet apply -f -
 ```
-
-Plus `boss@agents.local` for the operator, by hand or by the same script.
 
 **`fleet@agents.local` is a service identity, not an agent.** It gets a mailbox and a
 credential; it must **not** appear in `FLEET_PEERS` and must **not** be given
 `FLEET_HMAC_SECRET`. An address that cannot sign is refused the moment it claims to be an
-agent, which is the correct behaviour and worth keeping.
+agent, which is correct and worth keeping.
 
-## Verifying the move
+## The check that matters
 
-Three checks, and the third is the one worth doing properly:
-
-1. An agent can read: IMAP login on `143` with STARTTLS succeeds.
-2. An agent can send: submission on `587` with credentials succeeds.
-3. **A stranger cannot relay.** From a LAN host with no credentials, attempt to send through
-   `:25` to an outside address. It must be refused. This is the check the whole exercise is
-   for, and it is the one that passes by accident if `PERMIT_DOCKER` finds its way back in.
+**A stranger cannot relay.** From a LAN host with no credentials, attempt to send through `:25`
+to an outside address; it must be refused. This is the one that passes by accident if
+`PERMIT_DOCKER` ever finds its way back in.
