@@ -70,7 +70,7 @@ class Plane:
                 outer.last_auth = self.headers.get("Authorization")
                 if self.path.startswith("/fleet/pause"):
                     outer.hits["pause"] += 1
-                    return self._reply({"paused": outer.paused})
+                    return self._reply({"paused": outer.paused, **outer.settings})
                 if self.path.startswith("/settings"):
                     outer.hits["settings"] += 1
                     return self._reply(outer.settings)
@@ -304,10 +304,30 @@ check("with no plane configured the local default still applies",
 
 use(plane.url)
 plane.settings = {"inter_agent_thread_cap": 6}
-before = plane.hits["settings"]
+before = plane.hits["pause"]
 [fleet_control.inter_agent_thread_cap() for _ in range(5)]
 check("the value is cached, so this is not a request per message",
-      plane.hits["settings"] - before == 1, f"{plane.hits['settings'] - before} requests")
+      plane.hits["pause"] - before == 1, f"{plane.hits['pause'] - before} requests")
+
+# THE POINT OF MOVING IT ONTO /fleet/pause. That call already happens before every poll, so
+# the cap must ride along on it rather than cost a second round trip. If this ever reads 1,
+# the cap has drifted back onto its own endpoint.
+use(plane.url)
+plane.settings = {"inter_agent_thread_cap": 4}
+fleet_control.paused()                      # the call the worker already makes
+before = plane.hits["pause"]
+check("the cap is free after paused() — it rode in on the same response",
+      fleet_control.inter_agent_thread_cap() == 4 and plane.hits["pause"] == before,
+      f"{plane.hits['pause'] - before} extra requests")
+
+# A plane that has not shipped the field yet must not break the kill switch.
+use(plane.url)
+plane.settings = {}
+p, _ = fleet_control.paused()
+check("an older plane with no cap field still answers the kill switch", p is False)
+check("  ...and the cap falls back to the local default",
+      fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
+plane.settings = {"inter_agent_thread_cap": 8}
 
 print("\n" + ("ALL FLEET CONTROL TESTS PASSED" if all_ok else "SOME TESTS FAILED"))
 plane.stop()

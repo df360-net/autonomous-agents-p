@@ -6,7 +6,7 @@ land on either box, a shared directory is not shareable and both controls quietl
 per-agent — which is worse than having none, because the number still looks right. They move
 behind the fleet control plane's HTTP API; this module is the client.
 
-    GET  /fleet/pause                    -> {"paused": bool}
+    GET  /fleet/pause                    -> {"paused": bool, "inter_agent_thread_cap": int}
     POST /fleet/spend  {agent, amount}   -> {"total", "ceiling", "over", ...}
 
 THE WHOLE POINT OF THIS FILE IS THE DIRECTION IT FAILS IN.
@@ -125,6 +125,13 @@ def paused():
                                   f"fleet as PAUSED until it answers")
         return True, f"the fleet control plane is unreachable ({e}), so work is paused"
     is_paused = bool(answer.get("paused"))
+    # The thread cap rides on this same response, so read it while we have it. Deliberately
+    # tolerant: a plane that has not been upgraded yet simply omits the field, and that must
+    # leave the kill switch working rather than turning a governance change into an outage.
+    try:
+        _cap_from(answer, now)
+    except (TypeError, ValueError) as e:
+        log(f"ignoring a malformed inter_agent_thread_cap on /fleet/pause ({e})")
     with _lock:
         _pause_cache.update(at=now, paused=is_paused)
     _log_state("paused" if is_paused else "running",
@@ -153,6 +160,10 @@ def inter_agent_thread_cap():
     Unlike `paused()` this does not fail closed to a stop, because it cannot: refusing all peer
     traffic when the plane blinks would break collaboration on a network hiccup. It fails to
     the DEFAULT instead, which is the same shape of answer, just not the operator's chosen one.
+
+    IT RIDES ON /fleet/pause, which is already fetched before every poll — so this normally
+    costs no request at all. `paused()` stores the value on the way past, and the cold path
+    below asks the same endpoint rather than a second one.
     """
     if not enabled():
         return DEFAULT_THREAD_CAP
@@ -161,17 +172,25 @@ def inter_agent_thread_cap():
         if now - _settings_cache["at"] < PAUSE_TTL and _settings_cache["value"] is not None:
             return _settings_cache["value"]
     try:
-        answer = _request("GET", "/settings")
-        raw = answer.get("inter_agent_thread_cap")
-        # A missing key is not a zero. `int(None)` would raise and `or 0` would read an
-        # explicit 0 and a missing field as the same thing — the one distinction that matters.
-        cap = DEFAULT_THREAD_CAP if raw is None else max(0, int(raw))
+        return _cap_from(_request("GET", "/fleet/pause"), now)
     except (OSError, TypeError, ValueError) as e:
         log(f"cannot read inter_agent_thread_cap ({e}) — using the default of "
             f"{DEFAULT_THREAD_CAP}")
         return DEFAULT_THREAD_CAP
+
+
+def _cap_from(answer, now=None):
+    """Pull the cap out of a /fleet/pause response and remember it.
+
+    A MISSING KEY IS NOT A ZERO, and that is the whole function. `int(None)` raises and
+    `or 0` reads an explicit 0 and an absent field as the same thing — but 0 means "governance
+    turned the cap off" and absent means "nobody said", and collapsing those is what turns an
+    unreadable policy into no policy. Only the plane may say 0.
+    """
+    raw = (answer or {}).get("inter_agent_thread_cap")
+    cap = DEFAULT_THREAD_CAP if raw is None else max(0, int(raw))
     with _lock:
-        _settings_cache.update(at=now, value=cap)
+        _settings_cache.update(at=now if now is not None else time.time(), value=cap)
     return cap
 
 
