@@ -61,6 +61,23 @@ MAX_THREAD_DEPTH = int(os.environ.get("AGENT_MAX_THREAD_DEPTH", "20"))
 # rather than a protocol.
 PURPOSES = ("task", "review-request", "review-result", "question", "answer")
 
+# The half of that table that CLOSES an exchange rather than opening one. Running one of these
+# as a task is what turned a single "ask agent2 for an ack" into ten hops of worker+reviewer
+# cycles: an answer became a task, the task produced a reply, and the reply was another answer.
+# Asking "what should I do about an acknowledgement?" has exactly one safe answer — nothing.
+TERMINAL_PURPOSES = ("answer", "review-result")
+
+# A backstop for agent traffic, deliberately above BOTH other limits so it can never fire first
+# and silently cap a conversation below the bound actually chosen for it. Reaching it means the
+# hop counter has stopped working, which is the only thing it is here to catch.
+#
+# Above MAX_THREAD_DEPTH as well as MAX_HOPS, and the `+ 4` is not cosmetic. Written first as
+# max(MAX_THREAD_DEPTH, MAX_HOPS + 4), it collapsed to exactly MAX_THREAD_DEPTH at the default
+# hop limit of 3 — which silently reimposed the human depth cap on agents, the precise exemption
+# the comment in admit() exists to defend. A test that had been asserting that exemption for
+# months caught it.
+AGENT_DEPTH_CEILING = max(MAX_THREAD_DEPTH, MAX_HOPS) + 4
+
 # Who may task this agent. "*" means anyone, which is the default and is DELIBERATE: a task
 # email that silently never runs is a worse failure than an ugly one, and the money control is
 # the budget ceiling, not this. Set it (comma-separated addresses, or "@domain" for a whole
@@ -185,12 +202,18 @@ def _is_self(envelope):
     return any(_address(v) in mine for v in (envelope.requester, envelope.reply_to))
 
 
-def admit(envelope):
+def admit(envelope, thread_cap=None):
     """Resolve the principal and decide whether this envelope may run at all.
 
     Returns a Decision whose `envelope` is the sanitised copy: for anything not attested, the
     machine fields are put back to the values a stranger cannot influence. Callers use that copy
     and nothing else.
+
+    `thread_cap` is the control plane's `inter_agent_thread_cap`, PASSED IN rather than fetched.
+    This function is called once per message and has to stay pure and offline — a governance
+    lookup buried in it would put an HTTP round trip inside every admission check and make the
+    whole security surface untestable without a server. The worker reads the value once per
+    fetch and hands it down. None means "nobody has said", which is not the same as 0.
     """
     # 1. TENANCY, from our own identity and never from the payload. The inbox stamps these from
     #    fleet_identity today, so this cannot currently fail — which is the point of asserting
@@ -271,11 +294,55 @@ def admit(envelope):
         return Decision(False, principal, clean,
                         f"thread is {depth} messages deep (>= {MAX_THREAD_DEPTH}) — a loop")
 
+    #    For AGENTS the same guard exists, but strictly ABOVE the hop limit, so it cannot do the
+    #    silent early-capping the paragraph above warns about. It is insurance against the hop
+    #    counter itself failing — a peer that stops stamping, a reply path that resets it, a
+    #    version skew. If it ever fires, the number is not the interesting part: it means the
+    #    primary bound is broken, and the message says so rather than reporting a tidy limit.
+    #    GOVERNANCE'S CAP comes first, because it is the one an operator can actually turn.
+    #    Checked before the ceiling below so that the reason an agent stopped is the policy
+    #    someone set, not a backstop that happens to be nearby. 0 disables it, and only the
+    #    plane can say 0 — fleet_control resolves an unreadable answer to a default, never off.
+    if (principal.kind == "agent" and thread_cap and depth >= thread_cap):
+        return Decision(False, principal, clean,
+                        f"thread is {depth} messages deep and governance caps agent threads at "
+                        f"{thread_cap} — not taking part further")
+
+    if principal.kind == "agent" and depth >= AGENT_DEPTH_CEILING:
+        return Decision(False, principal, clean,
+                        f"thread is {depth} messages deep with hops only at {clean.hops} — "
+                        f"hop counting has failed, because {AGENT_DEPTH_CEILING} is above the "
+                        f"hop limit of {MAX_HOPS} and should have been unreachable")
+
     # 7. ROUTING. An unknown verb from a peer is a version skew, and guessing is how one agent
     #    silently does the wrong job for another.
     if principal.kind == "agent" and clean.purpose not in PURPOSES:
         return Decision(False, principal, clean,
                         f"unknown purpose {clean.purpose!r} from {principal.principal_id}")
+
+    # 8. TERMINAL PURPOSES — THE LOOP BREAKER.
+    #    An answer and a review result CLOSE an exchange. Running one as a task is what made a
+    #    one-shot "send agent2 a message and ask for an ack" run for ten hops at a full
+    #    worker+reviewer cycle each: the ack arrived as a task, the task produced a reply, the
+    #    reply was another ack. "Acknowledge a peer message" has no fixed point — there is
+    #    always one more acknowledgement to send.
+    #
+    #    Refused rather than run-but-told-not-to-reply, for two reasons. The obvious one is
+    #    cost: refusing spends nothing, while the alternative spends two LLM cycles to decide
+    #    to stay quiet. The real one is that the instruction not to reply would live in the
+    #    prompt, and a safety property in the prompt is a property the model can talk itself
+    #    out of — this is the same rule as the hop counter the agent cannot see or change.
+    #
+    #    NOTHING IS LOST BY DROPPING IT. Every peer message copies the boss (agent_outbox
+    #    enforces it), so the answer is already in a human's inbox. The asking agent could not
+    #    have used it anyway: its task finished when it sent the question, so the answer arrives
+    #    after the only conversation that wanted it has ended. If an agent ever needs to WAIT
+    #    for an answer, that is a synchronous exchange and needs designing as one — it is not
+    #    this, and pretending otherwise is what produced the loop.
+    if principal.kind == "agent" and clean.purpose in TERMINAL_PURPOSES:
+        return Decision(False, principal, clean,
+                        f"{clean.purpose!r} from {principal.principal_id} closes an exchange — "
+                        "recorded via the boss copy, not answered")
 
     return Decision(True, principal, clean)
 

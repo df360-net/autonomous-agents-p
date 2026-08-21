@@ -48,7 +48,8 @@ class Plane:
         self.paused = False
         self.over = False
         self.status = 200
-        self.hits = {"pause": 0, "spend": 0}
+        self.hits = {"pause": 0, "spend": 0, "settings": 0}
+        self.settings = {"inter_agent_thread_cap": 8}
         self.last_body = None
         self.last_auth = None
         outer = self
@@ -70,6 +71,9 @@ class Plane:
                 if self.path.startswith("/fleet/pause"):
                     outer.hits["pause"] += 1
                     return self._reply({"paused": outer.paused})
+                if self.path.startswith("/settings"):
+                    outer.hits["settings"] += 1
+                    return self._reply(outer.settings)
                 return self._reply({"total": 0}, 200)
 
             def do_POST(self):
@@ -93,6 +97,7 @@ def use(url, token=""):
     fleet_control.BASE_URL = url.rstrip("/")
     fleet_control.TOKEN = token
     fleet_control._pause_cache.update(at=0.0, paused=False)
+    fleet_control._settings_cache.update(at=0.0, value=None)
     fleet_control._last_logged["state"] = None
 
 
@@ -265,6 +270,44 @@ except agent_budget.BudgetExceeded as e:
     check("  ...and leaves the local pause file, so it survives losing the control plane",
           os.path.exists(os.environ["FLEET_PAUSE_FILE"]))
 plane.over = False
+
+print("\n--- inter_agent_thread_cap: unreadable is not 'off' ---")
+# Governance owns the number; the agent owns enforcing it. The direction that matters is what
+# happens when the answer cannot be read — a loop of agents acknowledging each other has
+# already happened once, so "I could not read the policy" must never resolve to "no policy".
+use(plane.url)
+plane.settings = {"inter_agent_thread_cap": 5}
+check("the plane's value is used", fleet_control.inter_agent_thread_cap() == 5)
+
+use(plane.url)
+plane.settings = {"inter_agent_thread_cap": 0}
+check("0 is honoured — but ONLY because the plane said it",
+      fleet_control.inter_agent_thread_cap() == 0)
+
+use(plane.url)
+plane.settings = {}                       # field missing, not zero
+check("a MISSING field falls back to the default, it does not read as 0",
+      fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
+
+use(plane.url)
+plane.settings = {"inter_agent_thread_cap": "not-a-number"}
+check("a malformed value falls back to the default rather than raising into the fetch loop",
+      fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
+
+use(f"http://127.0.0.1:{free_port()}")    # nothing listening
+check("an unreachable plane falls back to the default, not to unlimited",
+      fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
+
+use("")                                   # no control plane configured at all
+check("with no plane configured the local default still applies",
+      fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
+
+use(plane.url)
+plane.settings = {"inter_agent_thread_cap": 6}
+before = plane.hits["settings"]
+[fleet_control.inter_agent_thread_cap() for _ in range(5)]
+check("the value is cached, so this is not a request per message",
+      plane.hits["settings"] - before == 1, f"{plane.hits['settings'] - before} requests")
 
 print("\n" + ("ALL FLEET CONTROL TESTS PASSED" if all_ok else "SOME TESTS FAILED"))
 plane.stop()

@@ -28,6 +28,7 @@ import agent_outbox
 import agent_peer
 import agent_principal
 import agent_validator
+import fleet_control
 import fleet_identity
 import fleet_register
 
@@ -473,6 +474,12 @@ def peer_note():
         "are unsure of, or when a task concerns an app THEY built and you did not (you cannot "
         "push to their repositories; ship_app will refuse). It is email, so the answer comes "
         "back long after this task has ended.\n"
+        "WHOEVER READS THAT ANSWER, IT WILL NOT BE YOU. A reply arrives when this task is over, "
+        "so the harness delivers it to the human and does not start a new run for it — an "
+        "answer that started another task would be answered in turn, and two agents "
+        "acknowledging each other never stop. So do not plan work that waits on a reply, and "
+        "do not promise the human that you will act on one. Ask when the human would want the "
+        "colleague's view on the record; do the work yourself when the work is yours.\n"
         f"Every message between agents is copied to {agent_peer.BOSS_ADDRESS}, always. Write "
         "them as something a human reads over your shoulder, because one does."
     )
@@ -491,7 +498,9 @@ def run(envelope):
     # one place, and never re-litigated below. `admit` hands back a SANITISED envelope; using
     # the original after this point would put the sender's own claims back in play, so it is
     # rebound rather than kept alongside.
-    decision = agent_principal.admit(envelope)
+    # The governance cap is read here, not inside admit(): one lookup per message, cached by
+    # fleet_control for the same TTL as the kill switch, and admit() stays offline and pure.
+    decision = agent_principal.admit(envelope, thread_cap=fleet_control.inter_agent_thread_cap())
     if not decision.allowed:
         # Logged and dropped, never answered. A refusal that replies is a refusal that can be
         # aimed: it turns the agent into a way to send mail to a third party, and if the cause

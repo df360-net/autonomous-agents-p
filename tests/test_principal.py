@@ -124,6 +124,77 @@ check("its purpose survives too", d.envelope.purpose == "review-request")
 check("from_agent is derived from the id, so the two cannot disagree",
       from_peer().from_agent is True and env().from_agent is False)
 
+# ---- the loop breaker --------------------------------------------------------
+# A one-shot "ask agent2 for an ack" ran for ten hops before an operator stopped it: the ack
+# arrived as a task, the task produced a reply, the reply was another ack. Each lap was a full
+# worker AND reviewer cycle. It was bounded — hops are signed and incremented — but the bound
+# was twenty, which is twenty LLM round trips to discover that nobody had anything to say.
+print("\n--- an exchange that is closing does not start a task ---")
+for _p in agent_principal.TERMINAL_PURPOSES:
+    d = agent_principal.admit(from_peer(purpose=_p))
+    check(f"REFUSED: {_p!r} closes an exchange, so it never becomes a task",
+          not d.allowed, d.reason)
+    check(f"  ...and the reason says it was recorded, not that it was rejected",
+          "recorded" in d.reason, d.reason)
+
+# The other half must keep working, or agents cannot collaborate at all.
+for _p in ("task", "question", "review-request"):
+    check(f"{_p!r} still runs — it opens an exchange rather than closing one",
+          agent_principal.admit(from_peer(purpose=_p)).allowed)
+
+# The terminal check must not become a way to silence a HUMAN. Purpose is a machine field;
+# a person's mail carries none, and nothing a human sends should be droppable this way.
+check("a human's message is unaffected by the terminal-purpose rule",
+      agent_principal.admit(env(purpose="answer")).allowed)
+
+print("\n--- governance's cap, passed in rather than fetched ---")
+# The plane serves inter_agent_thread_cap; the worker reads it once per message and hands it
+# down. admit() must stay offline — an HTTP call inside the admission check would put a round
+# trip on every message and make the security surface untestable without a server.
+def _at_depth(n, purpose="task"):
+    return agent_principal.replace(
+        from_peer(purpose=purpose, hops=1),
+        references=" ".join(f"<r{i}@x>" for i in range(n)))
+
+check("under the cap, the exchange continues",
+      agent_principal.admit(_at_depth(3), thread_cap=8).allowed)
+d = agent_principal.admit(_at_depth(8), thread_cap=8)
+check("at the cap, this agent stops taking part", not d.allowed, d.reason)
+check("  ...and names the policy, not a nearby backstop",
+      "governance caps agent threads at 8" in d.reason, d.reason)
+
+# 0 is OFF, and only the plane may say it. The local ceiling still applies underneath.
+check("cap 0 does not disable the ceiling that catches broken hop counting",
+      not agent_principal.admit(
+          _at_depth(agent_principal.AGENT_DEPTH_CEILING), thread_cap=0).allowed)
+check("cap 0 DOES allow a thread deeper than a cap would have permitted",
+      agent_principal.admit(_at_depth(12), thread_cap=0).allowed)
+
+# None means nobody has said, which must not read as 0/off.
+check("no cap supplied still leaves the ceiling in force",
+      not agent_principal.admit(
+          _at_depth(agent_principal.AGENT_DEPTH_CEILING), thread_cap=None).allowed)
+
+# A human's long thread is governed by MAX_THREAD_DEPTH, not by the agent cap.
+check("the agent cap does not apply to a human",
+      agent_principal.admit(env(references=" ".join(f"<r{i}@x>" for i in range(9))),
+                            thread_cap=8).allowed)
+
+print("\n--- the depth backstop sits ABOVE the hop limit, not below it ---")
+# The reason agents were exempt from the depth guard: duplicating the hop limit at a different
+# number silently caps conversations at whatever this happens to be. So it must be unreachable
+# in normal operation, and firing means the hop counter itself has stopped working.
+check("the agent ceiling is strictly above the hop limit",
+      agent_principal.AGENT_DEPTH_CEILING > agent_principal.MAX_HOPS,
+      f"{agent_principal.AGENT_DEPTH_CEILING} vs {agent_principal.MAX_HOPS}")
+_deep = agent_principal.replace(
+    from_peer(purpose="task", hops=1),
+    references=" ".join(f"<r{i}@x>" for i in range(agent_principal.AGENT_DEPTH_CEILING)))
+d = agent_principal.admit(_deep)
+check("REFUSED: a deep thread whose hop count stayed low", not d.allowed, d.reason)
+check("  ...and it says the hop counter failed, not that a tidy limit was reached",
+      "hop counting has failed" in d.reason, d.reason)
+
 # Each field in the signed set, tampered with one at a time.
 print("\n--- every signed field, tampered with ---")
 for label, mutation in (

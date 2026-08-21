@@ -133,6 +133,48 @@ def paused():
     return (True, "the fleet control plane says the fleet is paused") if is_paused else (False, "")
 
 
+# ---- Governance settings -----------------------------------------------------
+# The cap used when the plane has not told us otherwise. NOT a hardcoded policy — policy is the
+# plane's `inter_agent_thread_cap`. This is what applies while nobody has said, which must be a
+# real number rather than "unlimited": the failure it guards against is agents talking to each
+# other forever, and that has already happened once.
+DEFAULT_THREAD_CAP = int(os.environ.get("FLEET_DEFAULT_THREAD_CAP", "8"))
+_settings_cache = {"at": 0.0, "value": None}
+
+
+def inter_agent_thread_cap():
+    """How deep an agent-to-agent thread may get before this agent stops taking part.
+
+    0 means OFF, and ONLY the control plane may say so. An unreachable plane, a malformed
+    answer or a missing field all fall back to DEFAULT_THREAD_CAP rather than to 0 — "I could
+    not read the policy" must never resolve to "there is no policy", which is the direction
+    that let the loop run in the first place.
+
+    Unlike `paused()` this does not fail closed to a stop, because it cannot: refusing all peer
+    traffic when the plane blinks would break collaboration on a network hiccup. It fails to
+    the DEFAULT instead, which is the same shape of answer, just not the operator's chosen one.
+    """
+    if not enabled():
+        return DEFAULT_THREAD_CAP
+    now = time.time()
+    with _lock:
+        if now - _settings_cache["at"] < PAUSE_TTL and _settings_cache["value"] is not None:
+            return _settings_cache["value"]
+    try:
+        answer = _request("GET", "/settings")
+        raw = answer.get("inter_agent_thread_cap")
+        # A missing key is not a zero. `int(None)` would raise and `or 0` would read an
+        # explicit 0 and a missing field as the same thing — the one distinction that matters.
+        cap = DEFAULT_THREAD_CAP if raw is None else max(0, int(raw))
+    except (OSError, TypeError, ValueError) as e:
+        log(f"cannot read inter_agent_thread_cap ({e}) — using the default of "
+            f"{DEFAULT_THREAD_CAP}")
+        return DEFAULT_THREAD_CAP
+    with _lock:
+        _settings_cache.update(at=now, value=cap)
+    return cap
+
+
 def _log_state(state, message):
     """Log transitions, not polls. At a 20s cadence, logging every check would bury the one
     line that matters — the moment the answer changed — under three an hour times forever."""
