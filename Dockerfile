@@ -25,7 +25,13 @@ WORKDIR /app
 # the first rebuild, which produced an image missing agent_budget and crash-looped on import.
 # A list you have to remember to update is a list that will be out of date, and this one could
 # only fail at the moment you were relying on it most.
-COPY *.py /app/
+# FLATTENED ON PURPOSE: agent/*.py lands directly in /app, not in /app/agent.
+# The modules import each other as top-level names (`import agent_brain`), which is what makes
+# them runnable, testable and hot-patchable without a package on sys.path. Copying the folder
+# as a folder would mean either an __init__.py and a rewrite of every import in the fleet, or
+# a PYTHONPATH that has to be right in the image, in compose, in the pod spec and in CI. The
+# directory exists to organise the SOURCE tree; the container layout is unchanged by it.
+COPY agent/*.py /app/
 # The tests ship too. They are the only way to check a rebuilt image before trusting it, and
 # copying them in by hand after every rebuild has the same "remember to" problem as above.
 COPY tests/ /app/tests/

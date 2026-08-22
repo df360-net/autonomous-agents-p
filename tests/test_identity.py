@@ -9,7 +9,12 @@ import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..")
-sys.path.insert(0, ROOT)
+# BOTH LAYOUTS: agent/ in the source tree, flat /app in the image. See the Dockerfile.
+# This one also spawns a subprocess, so the same pair has to reach it via PYTHONPATH —
+# a child process inherits sys.path from the environment, not from us.
+AGENT = os.path.join(ROOT, "agent")
+PYPATH = os.pathsep.join([AGENT, ROOT])
+sys.path[:0] = [AGENT, ROOT]
 
 # Run against a known-empty identity environment. This matters in the real container, where
 # AGENT_ADDRESS is still set from when the container was created: inheriting it would make
@@ -36,7 +41,7 @@ def run(env_extra, code):
     supply the conflict and every case would look like it passed for the wrong reason.
     """
     env = {k: v for k, v in os.environ.items() if k not in DERIVED_VARS}
-    env.update(PYTHONPATH=ROOT, **env_extra)
+    env.update(PYTHONPATH=PYPATH, **env_extra)
     return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
 
 

@@ -2,7 +2,11 @@
 with a truthful transcript, and see whether it rejects it. This is the only test that proves
 the gate is not a rubber stamp."""
 import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# BOTH LAYOUTS, and the order matters. The source tree keeps the modules in agent/;
+# the image copies them flat into /app beside this tests/ directory (see the Dockerfile).
+# A test has to run in either, because the image ships these as its only self-check.
+sys.path[:0] = [os.path.join(_HERE, "..", "agent"), os.path.join(_HERE, "..")]
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import agent_validator
 

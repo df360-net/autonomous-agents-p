@@ -22,7 +22,11 @@ os.environ.update({
     "FLEET_PAUSE_FILE": os.path.join(WS, "FLEET-PAUSED"),
     "BUDGET_FILE": os.path.join(WS, "budget.json"),
 })
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# BOTH LAYOUTS, and the order matters. The source tree keeps the modules in agent/;
+# the image copies them flat into /app beside this tests/ directory (see the Dockerfile).
+# A test has to run in either, because the image ships these as its only self-check.
+sys.path[:0] = [os.path.join(_HERE, "..", "agent"), os.path.join(_HERE, "..")]
 import agent_envelope, agent_inbox, agent_outbox, agent_peer, agent_principal, fleet_identity
 
 all_ok = True

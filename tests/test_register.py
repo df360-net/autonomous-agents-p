@@ -23,7 +23,11 @@ for _k, _p in (("SPEND_LEDGER", ".spend.jsonl"), ("FLEET_LEDGER", ".spend.jsonl"
     os.environ[_k] = os.path.join(WS, _p)
 for _v in ("FLEET_CONTROL_URL", "FLEET_TOKEN"):
     os.environ.pop(_v, None)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# BOTH LAYOUTS, and the order matters. The source tree keeps the modules in agent/;
+# the image copies them flat into /app beside this tests/ directory (see the Dockerfile).
+# A test has to run in either, because the image ships these as its only self-check.
+sys.path[:0] = [os.path.join(_HERE, "..", "agent"), os.path.join(_HERE, "..")]
 import agent_envelope, agent_outbox, agent_worker                            # noqa: E402
 
 all_ok = True

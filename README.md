@@ -118,7 +118,7 @@ The brain is standalone — useful for a quick check that DeepSeek and the tool 
 $env:WORKSPACE="C:\tmp\ws"; python agent_brain.py "write add.py with a test"
 ```
 
-`python agent_worker.py --once` does exactly one poll cycle and exits.
+`python agent/agent_worker.py --once` does exactly one poll cycle and exits (inside the container it is `python agent_worker.py`, since the image copies the modules flat into `/app`).
 
 ## Tests
 
