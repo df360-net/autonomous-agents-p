@@ -853,6 +853,10 @@ def main():
         log("WARNING: AGENT_PASSWORD is empty — IMAP login will almost certainly fail.")
     if not os.environ.get("DEEPSEEK_API_KEY"):
         log("WARNING: DEEPSEEK_API_KEY is not set — every task will abort.")
+    # Said here, at boot, because the alternative is discovering it at send time — when the
+    # task is done, the reply is written, and the auth failure reads like a wrong password.
+    if _smtp_warning := agent_outbox.smtp_identity_warning():
+        log(_smtp_warning)
     # Memory first, and NOT inside the poll loop's exception handler: sync() exits the process
     # when there is neither a remote nor a local clone, and that exit has to happen here where
     # it is visible in `docker logs`, not be swallowed as a bad poll cycle.

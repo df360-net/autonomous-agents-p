@@ -38,6 +38,27 @@ AGENT_ADDRESS = fleet_identity.AGENT_ADDRESS
 VALIDATOR_NAME = fleet_identity.VALIDATOR_NAME
 VALIDATOR_ADDRESS = fleet_identity.VALIDATOR_ADDRESS
 
+
+def smtp_identity_warning(user=None, validator=None):
+    """The one way this agent's mail credential can be wrong, said at startup instead of at send.
+
+    validatorN@ is a send-as ALIAS for agentN's login — there is no validator account and no
+    validator password. Configuring SMTP_USER as a validator address therefore cannot work, and
+    with SPOOF_PROTECTION=1 on the server it fails at LOGIN, which is the worst moment: the
+    task is finished, the reply is composed, and the only symptom is an auth error that reads
+    like a wrong password rather than a wrong username.
+
+    Returns a warning line or "". A warning, not an exception — a fleet that is merely
+    misconfigured should still start and say so, the same way ALLOWED_SENDERS=* does.
+    """
+    user = (SMTP_USER if user is None else user).strip()
+    validator = (VALIDATOR_ADDRESS if validator is None else validator).strip()
+    if user and validator and user.lower() == validator.lower():
+        return (f"WARNING: SMTP_USER is {user}, but that is a send-as alias, not an account. "
+                f"There is no mailbox or password for it. Authenticate as "
+                f"{AGENT_ADDRESS} and use {validator} only in the From header.")
+    return ""
+
 # COPIED ON EVERY EMAIL THIS FLEET SENDS. Not just agent-to-agent: task replies, reviewer
 # sign-offs, everything. It lives HERE, at the one function every outbound message passes
 # through, rather than at each call site — a call site can be forgotten, and the next one
@@ -140,6 +161,21 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
             smtp.starttls(context=tls_context())
             smtp.ehlo()
         if SMTP_USER:
+            # ONE LOGIN, TWO FROM ADDRESSES — and that is now enforced by the mail server.
+            #
+            # This agent authenticates as agentN and sends as either agentN@ or validatorN@.
+            # validatorN@ is a SEND-AS ALIAS for this same login, not an account: there is no
+            # validator mailbox and no validator password. The server runs SPOOF_PROTECTION=1,
+            # so it rejects a MAIL FROM the authenticated login does not own — sending as
+            # another agent is refused (553), and logging IN as validatorN@ would fail outright
+            # because no such account exists.
+            #
+            # SO DO NOT MAKE THE CREDENTIAL DEPEND ON from_addr. That refactor was actually
+            # planned — "select credentials by From address", to allow per-validator accounts —
+            # and it is dead work now that the alias does the same job with no new secrets. A
+            # version that looked up a credential per sender would break every reviewer email
+            # the moment it shipped, and the failure would arrive at SEND time, after the work
+            # was finished and paid for.
             smtp.login(SMTP_USER, SMTP_PASSWORD)
         smtp.send_message(reply)
     log(f"sent {from_addr} -> {to}: {subject!r}")

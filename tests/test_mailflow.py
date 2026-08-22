@@ -29,6 +29,7 @@ for _k, _p in (("SPEND_LEDGER", ".spend.jsonl"), ("FLEET_LEDGER", ".spend.jsonl"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent_brain
 import agent_inbox
+import agent_outbox
 import agent_worker
 
 captured = []
@@ -121,5 +122,22 @@ before = len(captured)
 agent_worker.run(agent_inbox.envelope_from_bytes(
     RAW.replace(b"Boss <boss@agents.local>", b"agent1@agents.local"), seq=8))
 assert len(captured) == before, "worker replied to itself — mail loop!"
+
+# ---- one login, two From addresses -------------------------------------------
+# The mail server now runs SPOOF_PROTECTION=1, with validatorN@ as a SEND-AS ALIAS for agentN's
+# login rather than an account of its own. So the credential must never depend on the From
+# address — the refactor that would have made it depend on one was planned, and dropped.
+print("\n--- the send-as contract ---")
+ok_cfg = agent_outbox.smtp_identity_warning(user="agent1@agents.local",
+                                            validator="validator1@agents.local")
+assert ok_cfg == "", "authenticating as the agent is correct configuration and must not warn"
+warning = agent_outbox.smtp_identity_warning(user="validator1@agents.local",
+                                             validator="validator1@agents.local")
+assert warning, "SMTP_USER set to the validator alias must be caught at boot"
+assert "send-as alias, not an account" in warning, warning
+assert "agent1@agents.local" in warning, "the warning must name the address to use instead"
+# An empty SMTP_USER is the no-auth relay case, not a misconfiguration.
+assert agent_outbox.smtp_identity_warning(user="", validator="validator1@agents.local") == ""
+print("PASS  a validator SMTP_USER is caught at boot, and a correct one is silent")
 
 print("\nALL ASSERTIONS PASSED")
