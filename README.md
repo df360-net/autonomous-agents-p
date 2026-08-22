@@ -1,10 +1,15 @@
-# autonomous-agents — Phase 0
+# autonomous-agents
 
-One autonomous developer-agent, tasked by email. You email `agent1@agents.local` from a
-webmail UI in your browser; it builds the thing in its own container and replies with what
-it built, the files it wrote, and the commands it actually ran.
+A fleet of autonomous developer-agents, tasked by email. You email `agentN@agents.local` from a
+webmail UI in your browser; the agent builds the thing in its own container, a second agent
+reviews it independently, and you get back what it built, the files it wrote, and the commands
+it actually ran — plus the address, once the fleet has deployed it.
 
-Context, decisions and roadmap: [agent-reminder.md](agent-reminder.md).
+Four agents run as Kubernetes pods across two boxes today.
+
+Context, decisions and where we are: [agent-reminder.md](agent-reminder.md). The machinery and
+why it is shaped that way: [docs/Autonomous-Agents-Design.md](docs/Autonomous-Agents-Design.md).
+The plan and the decisions still open: [docs/Fleet-Design.md](docs/Fleet-Design.md).
 
 ## The pieces
 
@@ -53,23 +58,39 @@ No mail server or container needed — the brain and the mail transport are stub
 ```powershell
 python tests/test_gate.py        # review gate: pass, fail-then-fix, never-passes, two senders
 python tests/test_mailflow.py    # MIME decode, threading headers, self-mail loop guard
+python tests/test_principal.py   # who may task this agent: hops, thread depth, attestation
+python tests/test_register.py    # thread context across a process boundary, and the image tag
 python tests/test_faultinject.py # SPENDS REAL API CALLS - proves the gate rejects bad work
 ```
 
-`test_faultinject.py` is the important one. It hands the real reviewer a known-bad reply (the
-one that claimed "after exactly 11 months $10,000 reaches $20,000") and fails if it waves it
-through. Everything else can pass while the gate is a rubber stamp; only this catches that.
+Every suite except `test_faultinject.py` runs in CI and **gates the image**
+([.github/workflows/agent-runtime.yml](.github/workflows/agent-runtime.yml)). An agent image
+that boots and misbehaves is worse than one that does not build: it deploys, reports healthy,
+and spends money doing the wrong thing.
 
-## Known trade-offs (deliberate, MVP-only)
+`test_faultinject.py` is excluded deliberately, and it is also the most important one. It hands
+the real reviewer a known-bad reply (the one that claimed "after exactly 11 months $10,000
+reaches $20,000") and fails if it waves it through — everything else can pass while the gate is
+a rubber stamp, and only this catches that. It stays out of CI because it calls the real
+DeepSeek API, costs money per run, and has returned opposite verdicts on identical input. A
+gate that fails randomly gets ignored, and an ignored gate is worse than an absent one.
 
-- **No TLS.** `SSL_TYPE=` is empty and [config/dms/user-patches.sh](config/dms/user-patches.sh)
-  re-enables plaintext IMAP auth. Fine on a LAN bridge with no internet route; delete that
-  patch the day this stack gets a certificate.
-- **Unauthenticated SMTP on :25**, allowed by `PERMIT_DOCKER=connected-networks`, because
-  Postfix won't offer AUTH without TLS.
+## Known trade-offs (deliberate)
+
+- **Self-signed TLS.** Submission on `:587` and IMAP on `:143` both require STARTTLS, and
+  `SPOOF_PROTECTION=1` is on, but the certificate is self-signed — so agents run with
+  `TLS_VERIFY=false`. Do not turn that on without first giving the server a certificate they
+  can chain to: every agent stops receiving mail at once and the symptom reads like a wrong
+  password. Reasoning in [mail/README.md](mail/README.md).
 - **At-most-once tasking.** A message is flagged `\Seen` *before* the build starts, and its
   `Message-ID` is recorded in `/workspace/.processed.json`. If the worker dies mid-build the
   task is dropped, not retried — better than an agent that rebuilds and re-emails on a loop.
+  Lease-based claiming is designed and not built (D3 in the fleet design).
 - **Long-running servers still block.** `run_bash` is synchronous with a 300s kill. The
-  system prompt tells the agent to background servers and kill them; that is a prompt, not
-  an enforcement.
+  system prompt tells the agent to background servers; that is a prompt, not an enforcement.
+- **A preview is not reachable from outside the pod.** Nothing publishes an agent's ports. The
+  agent is told never to offer a local port as an address, and the fleet emails the real one
+  once the app is actually serving.
+- **Nothing measures the reviewers yet.** The gate's verdict now reaches the control plane and
+  withholds the announcement on a fail or on silence, but the canary rate and reviewer
+  agreement are not recorded, and they cannot be reconstructed after the fact.

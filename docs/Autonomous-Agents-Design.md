@@ -4,14 +4,15 @@ A fleet of autonomous developer-agents, each in its own container, **tasked the 
 human engineer: by email**. An agent reads the instruction, does the work, has it independently
 reviewed by a second agent, and replies with the result plus the evidence.
 
-Phase 0 is built and proven: one worker, one reviewer, email in and email out, on Zeenie. The
-agent keeps its own memory between tasks (§8), and its work now ships down a real CI/CD pipeline
-into Kubernetes, behind a human approval gate (§9).
+Built and running: **four agents as Kubernetes pods across two boxes**, tasked by mail, keeping
+their own memory between tasks (§8), shipping through GitHub CI into pods the fleet control
+plane deploys and addresses (§9), with a review verdict gating the announcement.
 
-*Status: 2026-08-02. Companion documents: [agent-reminder.md](../agent-reminder.md) (context
-handoff, decisions, gotchas), [README.md](../README.md) (deploy runbook), and
-`../React_Typescript/github_ci_cd/docs/Calculator_EPLX_SDLC_Journey.md` — the CI/CD estate §9
-plugs into.*
+*Status: 2026-08-22. This document describes the machinery and why each piece is shaped as it
+is; [Fleet-Design.md](Fleet-Design.md) owns the plan and the decisions still open, and wins
+where the two disagree. Companion documents: [agent-reminder.md](../agent-reminder.md) (context
+handoff), [agent/README.md](../agent/README.md) (what runs in the container),
+[mail/README.md](../mail/README.md) (why the mail server is configured as it is).*
 
 ---
 
@@ -41,75 +42,79 @@ The loop, the tools, the model — unchanged. The leverage is in the plumbing ar
 ## 2. Architecture
 
 ```
-                    ┌───────────────────────────────────────────────┐
-   you ──browser──▶ │ Roundcube  :8080                              │
-                    └───────────────────┬───────────────────────────┘
-                                        │ SMTP/IMAP
-                    ┌───────────────────▼───────────────────────────┐
-                    │ docker-mailserver                             │
-                    │   boss@agents.local                           │
-                    │   agent1@agents.local                         │
-                    │   validator1@agents.local                     │
-                    └───────────────────┬───────────────────────────┘
-                        IMAP poll (20s) │ ▲ SMTP (two senders)
-                    ┌───────────────────▼─┴─────────────────────────┐
-                    │ agent-worker container  (ports 3000-3009)     │
-                    │                                               │
-                    │   drain_inbox ──▶ agent_loop(worker prompt)   │
-                    │                        │                      │
-                    │                        ▼                      │
-                    │                   review gate  ◀── agent_loop │
-                    │                        │        (reviewer     │
-                    │                        │         prompt,      │
-                    │                        ▼         fresh ctx)   │
-                    │                   send_reply ×2               │
-                    │                                               │
-                    │   /workspace/AGENT.md AGENT-ASSETS.md         │
-                    │                  AGENT-AVOID.md      (§8)     │
-                    │   /workspace/task-NNNN-<slug>/  + built apps  │
-                    └───────────────────┬───────────────────────────┘
-                                        │ ship_app push                (§9)
-                    ┌───────────────────▼───────────────────────────┐
-                    │ github.com/df360-net/agent-<app>              │
-                    │   Actions: test -> build -> ghcr.io           │
-                    └───────────────────┬───────────────────────────┘
-                                        │ ci-watcher polls the API
-                    ┌───────────────────▼───────────────────────────┐
-                    │ kind cluster on Zeenie                        │
-                    │   ci-watcher pod ──▶ Kafka ──▶ governance pod │
-                    │                        ⏸ human approves       │
-                    │   Harness delegate ──▶ ns `agent-apps`        │
-                    │   agent-app-proxy 3100N ──▶ NodePort 3000N    │
-                    └───────────────────────────────────────────────┘
+   you ──▶ Roundcube on hp-tiger, or scripts/task_agent.py
+             │  mail to agentN@agents.local
+   ┌─────────▼────────────────────────────────────┐
+   │ docker-mailserver on hp-tiger                │  submission :587, IMAP :143
+   │   boss@  agent1..4@  validator1..4@ (alias)  │  STARTTLS, SPOOF_PROTECTION=1
+   └─────────┬────────────────────────────────────┘
+     IMAP    │ ▲ SMTP — one login, two From addresses
+   ┌─────────▼─┴──────────────────────────────────┐
+   │ agentN pod   namespace `fleet`, either box   │
+   │                                              │
+   │   agent_inbox ──▶ TaskEnvelope               │
+   │        │                                     │
+   │   agent_principal.admit()  attest + sanitise │
+   │        │                                     │
+   │   agent_memory.sync()      BEFORE the prompt │
+   │        │                                     │
+   │   agent_loop(worker) ──▶ review gate ◀── agent_loop(reviewer, fresh ctx)
+   │        │                       │             │
+   │        │                       ▼             │
+   │        │                 report_review ──────┼──▶ plane
+   │        ▼                                     │
+   │   send_reply ×2                              │
+   │                                              │
+   │   /memory/tenant  /memory/fleet   (git)      │
+   │   /workspace/task-NNNN-<slug>/    (scratch)  │
+   └──────┬─────────────────────────┬─────────────┘
+          │ ship_app push           │ ship_app register  (token-scoped HTTP)
+   ┌──────▼──────────────────┐  ┌───▼──────────────────────────────────┐
+   │ github.com/df360-net/   │  │ fleet control plane   hp-tiger:8091  │
+   │   agent-<app>           │  │   kill switch + inter-agent cap      │
+   │   Actions ──▶ ghcr.io   │  │   spend ledger + fleet ceiling       │
+   └─────────────────────────┘  │   app registry: assigns box, port,   │
+                                │     URL; renders Deployment+Service  │
+                                │   review verdicts gate the           │
+                                │     "it is live" email               │
+                                └──────────────────────────────────────┘
 ```
 
-Three containers on one Compose bridge on Zeenie (192.168.0.105). `agents.local` exists only
-inside that network — no external domain, no DNS, no TLS. Deliberate for the MVP. The lower half
-is the pre-existing EPLX estate the fleet now delivers through (§9).
+Nothing in this repository deploys anything. Pushing to `main` builds
+`ghcr.io/df360-net/agent-runtime:<sha>`; the infra/ops side declares a tag and rolls the pods.
+The control plane is theirs too. **A green build is not a deployed fix.**
 
 ### Files
 
 | file | role |
 |---|---|
-| [agent_brain.py](../agent_brain.py) | The agent loop, the four tools, the DeepSeek call, the worker's system prompt, and the `---EMAIL---` boundary. |
-| [agent_validator.py](../agent_validator.py) | The reviewer: same loop, reviewer's prompt, fresh context, its own shell. |
-| [agent_notes.py](../agent_notes.py) | The agent's memory across tasks: injects its three self-written notes files, and finds a free app port. |
-| [agent_delivery.py](../agent_delivery.py) | Delivery conventions: repo/image/Kubernetes naming, the three-ports-per-app scheme, the CI workflow, the manifest example, and the delivery half of the task notes. |
-| [ship_app.py](../ship_app.py) | The agent's only route to GitHub — `scaffold`, `push`, `status`, `logs`, `list`. On PATH in the container as `ship_app`. |
-| [agent_app_proxy.py](../agent_app_proxy.py) | Runs on the `kind` docker network; republishes NodePorts `30000-30009` as `31000-31009` so a deployed pod is openable in a browser. |
-| [agent_worker.py](../agent_worker.py) | I/O adapter: IMAP poll, task construction, review gate orchestration, report building, SMTP. |
-| [harness_apps.py](../../React_Typescript/github_ci_cd/governance/harness_apps.py) | *(in the EPLX project)* Creates a real per-app Harness service + pipeline by cloning `deployweb` through the API. |
-| [Dockerfile](../Dockerfile) | python 3.12 + node 22 + tsc + git + lsof — enough to actually build software. |
-| [docker-compose.yml](../docker-compose.yml) | mailserver + Roundcube + worker; ports, volumes, env. |
-| [scripts/deploy-zeenie.cmd](../scripts/deploy-zeenie.cmd) | Runs docker from the interactive session (see §11). |
-| [scripts/task_agent.py](../scripts/task_agent.py) | Task the agent from a terminal instead of the browser. |
-| [tests/](../tests/) | Gate, mail-path and fault-injection tests. No mail server required. |
+| [agent/agent_brain.py](../agent/agent_brain.py) | The agent loop, the four tools, the DeepSeek call, the worker's system prompt, and the `---EMAIL---` boundary. |
+| [agent/agent_validator.py](../agent/agent_validator.py) | The reviewer: same loop, reviewer's prompt, fresh context, its own shell. Owns verdict parsing. |
+| [agent/agent_worker.py](../agent/agent_worker.py) | I/O adapter and the container's entrypoint: poll, admit, sync memory, run, review, report, reply. |
+| [agent/agent_envelope.py](../agent/agent_envelope.py) | What a task *is*, independent of the transport that carried it. |
+| [agent/agent_inbox.py](../agent/agent_inbox.py) / [agent_outbox.py](../agent/agent_outbox.py) | The only mail-shaped code in the fleet. One SMTP login, two From addresses. |
+| [agent/agent_principal.py](../agent/agent_principal.py) | Who is asking, resolved before any handler runs. Hops, thread depth, terminal purposes, sanitisation. |
+| [agent/agent_peer.py](../agent/agent_peer.py) | Agent-to-agent messaging. The agent picks who and why; the harness owns hops, signature, thread and the operator CC. |
+| [agent/agent_budget.py](../agent/agent_budget.py) | Spend ledger, four ceilings, `BudgetExceeded(LLMError)`. |
+| [agent/agent_memory.py](../agent/agent_memory.py) | The part that survives the container: two git clones under `/memory`. |
+| [agent/agent_notes.py](../agent/agent_notes.py) | The agent's self-written notes, and the preview port nothing is listening on. |
+| [agent/agent_delivery.py](../agent/agent_delivery.py) | Delivery conventions: repo and image naming, the CI workflow, the manifest example, the delivery half of the task notes. |
+| [agent/ship_app.py](../agent/ship_app.py) | The agent's only route to GitHub and to app registration. On PATH in the container as `ship_app`. |
+| [agent/fleet_identity.py](../agent/fleet_identity.py) | One place that derives mailbox, memory path, labels and keys from `<tenant>/<name>`. |
+| [agent/fleet_control.py](../agent/fleet_control.py) | The money controls, across a network. **Fails closed.** |
+| [agent/fleet_register.py](../agent/fleet_register.py) | App registration, review verdicts, app status. |
+| [agent/git_auth.py](../agent/git_auth.py) | One credential path for every git push; the token never lands in `.git/config`. |
+| [agent/agent_app_proxy.py](../agent/agent_app_proxy.py) | The zeenie-era way of making a kind NodePort reachable from a browser. Not invoked by the worker; kept because the boxes differ in whether they need it. |
+| [Dockerfile](../Dockerfile) | python 3.12 + node 22 + tsc + git + lsof — enough to actually build software. Copies `agent/*.py` **flat** into `/app`. |
+| [provision_agent.py](../provision_agent.py) | Creates a mailbox and prints a k8s Secret. The password is never written down. |
+| [scripts/task_agent.py](../scripts/task_agent.py) | Task an agent from a terminal instead of the browser. |
+| [tests/](../tests/) | Offline suites, which also ship in the image as its only self-check. |
 
 ---
 
 ## 3. The agent loop
 
-[agent_brain.py](../agent_brain.py) — `agent_loop(task, workspace, system_prompt, messages, tag)`:
+[agent_brain.py](../agent/agent_brain.py) — `agent_loop(task, workspace, system_prompt, messages, tag)`:
 
 ```python
 messages = [system_prompt, task]              # the entire program state
@@ -154,7 +159,7 @@ than a fresh start. `tag` stamps every transcript entry with its author (§6).
 
 ## 4. Email as the task interface
 
-[agent_worker.py](../agent_worker.py). `main()` is `while True: poll_once(); sleep(POLL_SECONDS)`.
+[agent_worker.py](../agent/agent_worker.py). `main()` is `while True: poll_once(); sleep(POLL_SECONDS)`.
 
 **`drain_inbox`** connects, searches `UNSEEN`, and for each message: fetches with `BODY.PEEK[]`
 (so fetching doesn't implicitly consume it), flags `\Seen` **before any work happens**, records
@@ -209,6 +214,23 @@ human stays the last word.
 reviewer must not wave work through by being vague); a crashed reviewer counts as FAIL; and it is
 told explicitly *not* to block on style, tone, or work nobody asked for. `VALIDATION_ROUNDS=0`
 disables it entirely.
+
+### The verdict leaves the pod
+
+Passing the gate is not the end of the verdict's life. `report_review()` posts it to the fleet
+control plane, which holds the "it is live" email until someone has ruled.
+
+> **No verdict is not a pass.** If the gate did not run, or the plane could not be reached, the
+> announcement is held. Silence means nobody approved it.
+
+That call **fails soft**, unlike the spend calls, and the asymmetry is deliberate: raising here
+would abort a task whose reply has already been sent, and there is no "send anyway" fallback
+available. A failure to report costs a held announcement and a log line — never a false one.
+
+**A verdict is unanimous or it is a contradiction.** A reviewer that writes `VERDICT: FAIL`,
+reworks its own reasoning and ends `VERDICT: PASS` has not passed anything; `parse_verdict`
+requires every occurrence to agree and cuts the notes at the last one. Two parse bugs lived here
+and both resolved toward *pass*, which is the direction a gate must never fail in.
 
 ### The reviewer's checklist
 
@@ -269,34 +291,40 @@ Three properties of this block matter:
 
 ---
 
-## 7. Apps that actually run — locally
+## 7. The preview: an app the agent can test, and nobody else can reach
 
 An agent that builds a web app you cannot open is a demo. Everything in this section is still
-true, but it has been **demoted from delivery to testing**: a `nohup`'d server is now how the
-agent checks its own work, not how the work reaches anyone. Real delivery is §9.
+how the agent checks its own work — and it has been **demoted from delivery to testing**. Real
+delivery is §9.
 
-- Compose publishes **3000–3009**; the harness picks the first port in that range with **nothing
-  listening** (a TCP connect, not a bind — the agent's own servers are in this container and bound
-  to `0.0.0.0`, so a bind test reports "free" right up until you steal the port from a live app)
-  and injects it into the task text. Only when all ten are busy does it fall back to
-  `3000 + seq % 10` and reclaim with `lsof -t -i:PORT | xargs -r kill -9`.
-  The original rule *always* rotated and killed, which is fine while every app is a throwaway and
-  fatal the moment one is maintained: task 22 would have shot task 12's booking app in the head to
-  make room for a scratch server. The task text now also says: **if you are changing something
-  already serving on a port, keep that port** — moving it breaks the link people already have.
-- The prompt says **background it and leave it running**, then report the URL:
-  `nohup cmd > log 2>&1 &`. **The redirect is load-bearing**: without it the background child
-  holds the capture pipe and `run_bash` hangs to its timeout even though the server started fine.
-- The reviewer **curls it** — from inside and outside — and is told not to settle for HTTP 200.
+**Nothing publishes a pod's ports.** The preview server binds inside the agent's own container
+and is reachable from the agent, from its reviewer, and from nowhere else. That fact has to be
+said plainly and repeatedly, because the failure it prevents is one an agent commits
+confidently: offering a local port as an address, in an email, to a human, who then cannot open
+it. A local port is for testing; the fleet emails the real address itself, once a pod is
+genuinely serving.
 
-Proven: *"Build me a tic-tac-toe web app… send me the link"* → html/css/js + a Node static server,
-backgrounded, `http://192.168.0.105:3001` in the reply, independently fetched by validator1
-(`grep -c 'class="cell"'` → 9), opened and played in a browser.
+- The harness picks the first port in `APP_PORT_BASE..+APP_PORT_COUNT` with **nothing
+  listening** — a TCP connect, not a bind. The agent's own servers are in this container bound
+  to `0.0.0.0`, so a bind test reports "free" right up until you steal the port from a live app.
+  Only when all of them are busy does it fall back to `base + seq % count` and reclaim with
+  `lsof -t -i:PORT | xargs -r kill -9`.
+  The original rule *always* rotated and killed, which is fine while every app is a throwaway
+  and fatal the moment one is maintained: task 22 would have shot task 12's booking app in the
+  head to make room for a scratch server. The task text also says: **if you are changing
+  something already serving on a port, keep that port.**
+- The prompt says **background it and leave it running**, then report what it verified:
+  `nohup cmd > log 2>&1 &`. **The redirect is load-bearing** — without it the background child
+  holds the capture pipe and `run_bash` hangs to its timeout even though the server started
+  fine. The agent walked into a variant of this anyway (`cd app && nohup ... &` backgrounds the
+  *whole list*, so the outer `cd` still holds the pipe), which is the sort of thing that belongs
+  in a lessons file the agent writes in its own words, not in prompt text we write once.
+- The reviewer **curls it** and is told not to settle for HTTP 200 — check the body contains the
+  thing that was promised.
 
-**Known limits of the local server** — and the reason §9 exists: it dies when the container
-restarts, nobody reviewed the code that produced it, nobody approved its release, and it is not
-built from anything you could rebuild. It is a preview, and the agent is now required to describe
-it as one.
+**Known limits, and the reason §9 exists:** the preview dies with the pod, nobody reviewed the
+code that produced it, nobody approved its release, and it is not built from anything you could
+rebuild. It is a preview, and the agent is required to describe it as one.
 
 ---
 
@@ -314,8 +342,18 @@ new task folder and fixed the copy**, leaving the original running with the bug;
 into `.env` while the server kept announcing 3002; and finally `pkill -f dist/src/index.js`'d
 both, unable to tell its fork from the original. Discovery worked. *Identity* did not.
 
-So the agent keeps three files at the root of its workspace, in the spirit of the `CLAUDE.md` a
-human engineer leaves for the next session. They are split by **when you reach for them**, not by
+So the agent keeps three files, in the spirit of the `CLAUDE.md` a human engineer leaves for the
+next session.
+
+> **Where they live changed, and nothing else about them did.** They were files in the container's
+> workspace; they are now files in a git clone under `/memory`, synced at boot and at the top of
+> every task **before** the notes are pasted into the prompt. `AGENT.md` and `AGENT-AVOID.md` are
+> shared by every agent in the tenant, `AGENT-ASSETS.md` is private to each, and a fourth file —
+> `FLEET.md` — is operator-only and writable by no agent. The paths below are historical; the
+> four rules are not. See [agent_memory.py](../agent/agent_memory.py) and D5 in
+> [Fleet-Design.md](Fleet-Design.md).
+
+They are split by **when you reach for them**, not by
 subject:
 
 | file | what goes in it | read when |
@@ -378,98 +416,80 @@ current task touched.
 ## 9. Delivery: shipping to Kubernetes
 
 *Jianmin's idea, 2026-08-02: "Going forward, any applications need to be checked into GitHub, the
-GitHub CI auto kicks off, the Harness agent does the CD. Let the agent understand we have
-Kubernetes pods. Each app should deploy to a pod."*
-
-The agent could build software and could not release it. The other half already existed: a full
-enterprise SDLC mockup at `../React_Typescript/github_ci_cd` — GitHub Actions CI, ghcr.io, a Kafka
-event bus, a governance app with a **human approval gate**, Harness CD, and a kind cluster. Built
-for one app, the calculator. This section connects the fleet to it.
+GitHub CI auto kicks off... Let the agent understand we have Kubernetes pods. Each app should
+deploy to a pod."* One repository per app; one deployment per app.
 
 ### The chain
 
 ```
-  email ──▶ agent1 builds and tests locally on 3000-3009            (§7 — a preview)
+  email ──▶ agentN builds and tests on a preview port           (§7 — dies with the pod)
               │  writes Dockerfile + ci/test.sh + k8s/deployment.yaml
               ▼
          ship_app push ──▶ github.com/df360-net/agent-<app>
               │
               ▼
-    GitHub Actions (GitHub-HOSTED)   test ─▶ build ─▶ ghcr.io/df360-net/agent-<app>:<sha7>
+    GitHub Actions (GitHub-hosted)  test ─▶ build ─▶ ghcr.io/df360-net/agent-<app>:<sha7>
               │
               ▼
-    ci-watcher POD   polls the Actions API, emits ArtifactReady ──▶ Kafka eplx_deployments
+    ship_app register ──▶ POST /agent/apps {app, image, port, replicas, thread}
+              │
+              │           the control plane assigns the BOX, the NodePort and the URL
+              ▼
+    per-box daemon ──▶ renders Deployment + Service, runs the pod
               │
               ▼
-    governance POD   SCAN ─▶ CR_CREATE ─▶ ⏸ AWAITING_APPROVAL
-              │            (a HUMAN clicks Approve — the gate is the point)
-              │      ensure Harness service+pipeline exist ─▶ HARNESS_TRIGGER ─▶ poll ─▶ NOTIFY
-              ▼
-    Harness delegate ──▶ rolling deploy into namespace `agent-apps`
-              │
-              ▼
-    agent-app-proxy   31000+N ──▶ learn-control-plane:30000+N ──▶ the pod
-              ▼
-         http://192.168.0.105:3100N  in your browser
+    the plane emails the live address INTO THE AGENT'S OWN THREAD, once it is serving
 ```
+
+The review verdict rides alongside it: after the gate rules, `report_review()` posts pass or fail
+to the plane. With `ANNOUNCE_REQUIRES_REVIEW` on, a fail — **or silence** — withholds that final
+email. Registration happens mid-task, while the agent is still working; the verdict call is what
+closes the window in which the plane knows an app exists and does not know whether anyone
+approved it.
 
 ### Five decisions, each forced by something measured
 
-**1. CI polls, it is not pushed to.** The calculator's last CI job runs on a self-hosted runner on
-Zeenie because it must reach the LAN Kafka broker. That cannot scale to a fleet: `df360-net` is a
-**user account, not an organisation** (`user/orgs` is empty; the org-runner API 404s), and GitHub
-only supports org- and enterprise-level runners — so that runner is permanently scoped to one
-repo, and every new agent repo would need its own registration. A watcher **inside** the cluster
-polling the Actions API removes the problem: CI stays on GitHub-hosted runners, nothing in GitHub
-needs a route to the LAN, and adding the hundredth repo costs nothing.
+**1. The agent registers; it does not deploy, and it does not compute an address.** This is the
+one that changed most, and the reason is worth keeping. `http://{APP_HOST}:{PROXY_PORT_BASE +
+slot}` was arithmetic over two environment variables, so it produced a confident URL whether or
+not anything was listening on it — and it did exactly that, in emails, for apps nothing had
+deployed. Nothing errored; nothing was blank; the sentence was simply false. Both variables are
+gone from [agent_delivery.py](../agent/agent_delivery.py) and cannot come back, because the
+allocation now belongs to whoever runs the pod. **The manifest the agent commits still carries a
+NodePort. It is a plausible description of the app, not an allocation** — which is why a
+collision is now impossible rather than merely unlikely.
 
-**2. One repo and one Harness pipeline per app — created by API, not by hand.** Per-app pipelines
-are how Harness is really used, and a single generic catch-all pipeline pretending to be several
-would teach the wrong thing. But a human clicking through a Service and a Pipeline for every app
-caps an autonomous fleet at its owner's clicking speed. So
-[harness_apps.py](../../React_Typescript/github_ci_cd/governance/harness_apps.py) clones the
-hand-built `deployweb`/`web` pair through the API: four objects per app, idempotent, safe to
-re-run on every deploy so a changed manifest takes effect.
+**2. One repository per app, and the name is fleet-wide.** `agent-<app>` does not carry the
+tenant or the agent, so two agents asked to build "a todo list" resolve to the same repository
+and the second would silently overwrite the first's running application. `ship_app` records the
+owning agent in the repo and refuses a push from anyone else. The proper fix — addressing apps as
+`<tenant>/<app>` — is D4 in [Fleet-Design.md](Fleet-Design.md).
 
-| shared, created once | per app, created on first release |
-|---|---|
-| connector `ghcr`, connector `kindconnector`, environment `dev` | file `<app>.yaml` — the agent's own committed manifest |
-| infrastructure `agentapps` → namespace `agent-apps` | file `<app>-values.yaml` — `image: <+artifact.image>` |
-| | service `agent_<app>` |
-| | pipeline `deploy_agent_<app>` |
+**3. CI polls nothing and pushes nowhere private.** `df360-net` is a **user account, not an
+organisation** (`user/orgs` is empty; the org-runner API 404s), and GitHub supports runners only
+at org and enterprise level — so a self-hosted runner is permanently scoped to one repository and
+every new agent repo would need its own registration. Agent CI therefore runs on GitHub-hosted
+runners and ends at the image. Nothing in GitHub needs a route to the LAN, and the hundredth repo
+costs nothing.
 
-Harness identifiers must match `^[a-zA-Z_][0-9a-zA-Z_$]*$` — **hyphens are rejected**, while every
-other name in the system (repo, image, Kubernetes object) is hyphenated. One function, `ident()`,
-owns that conversion.
+**4. `ship_app` is a command, not an instruction.** Repository names, remote URLs with tokens in
+them, API paths and a workflow file that must be byte-correct are all harness work: exact,
+unforgiving, and identical every time. The agent decides *what* to ship;
+[ship_app.py](../agent/ship_app.py) decides *how* — `scaffold`, `push`, `status`, `logs`, `list`.
+The token reaches git through a `GIT_ASKPASS` helper ([git_auth.py](../agent/git_auth.py)) rather
+than the remote URL, so it never lands in `.git/config` for the next reader.
 
-**3. Three ports per app, from one index.** App slot `N` in 0..9 gives `3000+N` (local preview),
-`30000+N` (NodePort in the cluster), `31000+N` (what a browser opens). N belongs to the *app*, not
-the task — it has to survive a redeploy — so it lives in the agent's own `AGENT-ASSETS.md` and in
-the committed manifest. The harness only *suggests* the lowest unclaimed slot; a collision surfaces
-as a Kubernetes error, which is the same "ask the machine, not the notes" rule as §8.
-
-**4. A proxy, because kind's ports are frozen.** `docker inspect learn-control-plane` shows exactly
-one published port — `6443/tcp`, with an **empty binding** — and every Service in the cluster is
-`ClusterIP`. A pod Harness has just deployed is running perfectly and reachable from nowhere.
-kind's `extraPortMappings` are fixed at cluster creation, and recreating the cluster would discard
-a month of state. [agent_app_proxy.py](../agent_app_proxy.py) sits on the `kind` docker network —
-where the node is an ordinary TCP endpoint — and republishes ten NodePorts. Same pattern as the
-`kube-api-proxy` that already rescues the API server, generalised to a block. Adding an app needs
-no change to it.
-
-**5. `ship_app` is a command, not an instruction.** Repo names, remote URLs with tokens in them,
-API paths and a workflow file that must be byte-correct are all harness work: exact, unforgiving,
-and identical every time. The agent decides *what* to ship; [ship_app.py](../ship_app.py) decides
-*how* — `scaffold`, `push`, `status`, `logs`, `list`. The token reaches git through a `GIT_ASKPASS`
-helper rather than the remote URL, so it never lands in `.git/config` for the next reader.
+**5. The story is told in four places and they must agree.** `delivery_note` (the task notes),
+`agent_brain`'s system prompt, `ship_app scaffold` and `ship_app status`. An agent handed two
+accounts of the same pipeline splits the difference and invents a third — and `scaffold` is the
+*first* thing it reads, so a stale line there outranks a correct one later.
 
 ### What honesty requires here
 
-The reply email changes shape. The agent finishes when **CI is green**, not when the app is live,
-because a human still has to approve the release and that may take a day. It is told to report the
-image and the eventual URL *marked as pending approval*, to describe the local server as a preview
-that dies with the container, and specifically **not** to curl the cluster URL and report it as
-down. Governance's existing NOTIFY step sends the second message when the deploy lands.
+The agent finishes when **CI is green and the app is registered**, not when it is live. It is
+told to report the image and to describe the preview as a preview, and specifically **not** to
+curl an address it has not been given and report it as down. The plane sends the second message,
+threaded onto the agent's own reply, when the deploy lands.
 
 If `GITHUB_TOKEN` is absent, the delivery instructions are replaced by an explicit *"delivery is
 unavailable, say so and do not claim to have pushed anything"*. An agent told to ship without
@@ -477,86 +497,141 @@ credentials will otherwise report having shipped.
 
 ### Traps found building it
 
-- **`<+artifact.image>` in a manifest is not resolved.** Pods came up `InvalidImageName` with the
-  literal expression as their image. Harness evaluates its expressions in the **values** file and
-  then renders the manifest as a Go template — so the manifest must say `{{.Values.image}}` and a
-  per-app values file must carry `image: <+artifact.image>`. The calculator's `web` service was
-  doing this all along; it was the one part of the template not obvious from the pipeline YAML.
-- **`imagePullSecrets: [ghcr-cred]` is mandatory** (the registry is private) **and secrets are
-  namespaced** — `agent-apps` needed its own copy. Omit it and the failure looks like a broken
-  image rather than a missing credential.
-- **Harness reports "not found" as HTTP 400 with `RESOURCE_NOT_FOUND_EXCEPTION`**, not 404, on most
-  NG endpoints. Treating only 404 as absence makes every first-ever create look like an outage.
-- **`workflow` scope is not optional** on the agent's PAT. Without it GitHub rejects any push that
-  touches `.github/workflows/`, with a message that reads like a permissions bug.
-- **Kafka and redpanda-console were stopped** — they are in the lab's "pause to reclaim CPU"
-  runbook, and the whole CD chain runs through them.
-- `docker cp` into a *created-but-never-started* container fails if the destination directory does
-  not exist in the image; and `docker pull` still cannot run over SSH (§11), so the proxy uses
-  `python:3.12-slim`, which was already cached.
+- **One port, read from one place.** The generated app reads `PORT` with a default
+  (`PORT="${PORT:-8080}"; export PORT`), the manifest's `containerPort` is the value the plane
+  reads and sets `PORT` from, and nothing else declares a port. Getting this wrong presents as
+  `connection refused`, which reads like a crashed server rather than a misconfiguration.
+- **The image tag has exactly one definition.** `agent_delivery.image_tag()` and the CI workflow
+  template are generated from the same constant, and
+  [tests/test_register.py](../tests/test_register.py) pins them together. `git rev-parse --short`
+  is **not** a safe substitute: `core.abbrev=auto` grows the abbreviation with the object count,
+  so a repo that tags 7 characters today tags 8 later and `register()` names an image that does
+  not exist. That bug stalled a real deploy.
+- **The Service publishes 80 and targets the containerPort.** They are not the same number by
+  design, and a test that demands they match is wrong.
+- **Internal markers must stay out of the deliverable.** `.fleet-registered` was one skip-list
+  entry away from being emailed to the requester as an attachment.
+- **`workflow` scope is not optional** on the agent's PAT. Without it GitHub rejects any push
+  that touches `.github/workflows/`, with a message that reads like a permissions bug.
 
-### Proven, and not yet
+### Two pipelines were retired underneath this section
 
-**Proven end to end (2026-08-02).** A hand-written probe app — deliberately not agent-built, to
-separate pipeline faults from agent faults — went `git push` → CI green on the first run →
-`ghcr.io/df360-net/agent-pipeline-probe:cc1cdf8` → Harness `Success` → two pods `1/1` in
-`agent-apps` → **`http://192.168.0.105:31000` answering HTTP 200 in a browser**, the page naming its
-own pod (`pipeline-probe-5498fbf8f8-sbpf4`). The probe stays as a reference deployment.
+Worth knowing so nobody goes looking for machinery that is gone.
 
-**Not yet wired:** the ci-watcher pod, the governance changes that consume a per-app event, and the
-approval gate for agent apps. That deploy was triggered by calling Harness directly
-(`harness_apps.py deploy`), which bypassed all three.
+**Kafka → ci-watcher → governance approval → Harness CD.** The fleet originally delivered through
+the pre-existing enterprise SDLC mockup at `../React_Typescript/github_ci_cd`, including a human
+approval gate and per-app Harness pipelines created by API (`harness_apps.py` cloned four objects
+per app because a human clicking through a Service and a Pipeline for every app caps an
+autonomous fleet at its owner's clicking speed). It was switched off. For a day the chain
+genuinely ended at the image, and the prose here said so.
+
+What survived the retirement is the *shape*, not the tooling: an image built by CI, a deploy
+performed by something that is not the agent, an address the agent is told rather than computes,
+and a human able to withhold the release. The lesson that outlived the machinery is decision 1
+above — **do not let the agent's own claim be the release**, and do not let it construct the
+address either.
+
+The traps from that era are recorded in git history. Three are still true of anyone integrating
+Harness: `<+artifact.image>` is resolved in the **values** file and the manifest must use
+`{{.Values.image}}`; `imagePullSecrets` are namespaced and must be copied into the target
+namespace; and Harness reports "not found" as HTTP 400 with `RESOURCE_NOT_FOUND_EXCEPTION`, not
+404, so treating only 404 as absence makes every first-ever create look like an outage.
 
 ---
 
 ## 10. Configuration
 
+An agent pod's environment, delivered as a Kubernetes Secret (see
+[provision_agent.py](../provision_agent.py)) plus plain env. [.env.example](../.env.example)
+carries the same list with the reasoning.
+
 | variable | default | meaning |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | required; never printed |
+| `DEEPSEEK_API_KEY` | — | required; **never printed** |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | |
+| `TENANT` / `AGENT_NAME` | `dev` / — | identity. Everything else is derived from these two ([fleet_identity.py](../agent/fleet_identity.py)) |
+| `AGENT_PASSWORD` | — | the mailbox password, minted by the provisioner and never written to a file |
+| `FLEET_HMAC_SECRET` | — | fleet-wide, identical on every agent — it is how agents prove to each other that they are agents |
+| `FLEET_CONTROL_URL` / `FLEET_TOKEN` | — | the control plane, and this agent's scoped token. **Unset means "not in use", not "unreachable"** |
+| `FLEET_PAUSE_TTL` / `FLEET_HTTP_TIMEOUT` | 60 / 5 | how long a good answer is trusted, and how long to wait for one |
+| `MEMORY_TENANT_REMOTE` / `MEMORY_FLEET_REMOTE` | — | the two git remotes. Tenant unset = notes stay local; tenant set and unreachable with no clone = **refuse to start** |
+| `MEMORY_ROOT` | `/memory` | `fleet/` is read-only, `tenant/` is writable |
 | `MAX_STEPS` | 200 | runaway-loop backstop |
 | `MAX_TOOL_CHARS` | 8000 | per tool result, protects context |
 | `BASH_TIMEOUT` | 300 | seconds before a command is killed |
 | `POLL_SECONDS` | 20 | inbox poll interval |
-| `VALIDATION_ROUNDS` | 3 | review rounds before sending anyway; 0 disables |
-| `REVIEW_RESULT_CHARS` / `REVIEW_TRANSCRIPT_CHARS` | 800 / 20000 | how much record the reviewer is shown |
-| `MAX_REPLY_CHARS` | 40000 | reply body cap |
-| `NOTES_MAX_CHARS` | 8000 | per notes file, when pasted into a task (§8) |
-| `APP_HOST` / `APP_PORT_BASE` / `APP_PORT_COUNT` | 192.168.0.105 / 3000 / 10 | local preview ports |
-| `GITHUB_TOKEN` | — | PAT with **`repo` + `workflow`** scope. Unset = delivery disabled and the agent is told to say so (§9) |
+| `VALIDATION_ROUNDS` | 3 | review rounds before sending anyway; 0 disables the gate |
+| `MAX_REPLY_CHARS` / `NOTES_MAX_CHARS` | 40000 / 8000 | reply body cap; per notes file when pasted into a task |
+| `AGENT_MAX_HOPS` / `AGENT_MAX_THREAD_DEPTH` / `AGENT_MAX_PEER_SENDS` | 20 / 20 / 25 | the loop guards. Depth catches loops that carry no counter at all |
+| `AGENT_TASK_USD` / `AGENT_DAILY_USD` / `FLEET_DAILY_USD` | 20 / 150 / 500 | spend ceilings, deliberately loose |
+| `ALLOWED_SENDERS` | `*` | who may task this agent |
+| `GITHUB_TOKEN` | — | PAT with **`repo` + `workflow`** scope. Unset = delivery disabled, and the agent is told to say so |
 | `GITHUB_OWNER` | `df360-net` | repos become `<owner>/agent-<app>`, images `ghcr.io/<owner>/agent-<app>` |
-| `K8S_NAMESPACE` | `agent-apps` | where Harness deploys agent apps |
-| `NODE_PORT_BASE` / `PROXY_PORT_BASE` | 30000 / 31000 | app slot N → NodePort `30000+N`, browser port `31000+N` |
-| `HARNESS_*` | see `governance/.env` | account, org, project, API key; plus `HARNESS_AGENT_INFRA` (`agentapps`) |
-| `AGENT_ADDRESS` / `AGENT_PASSWORD` | agent1@agents.local | worker mailbox (reads and sends) |
-| `VALIDATOR_ADDRESS` | validator1@agents.local | reviewer; **sends only**, needs no password |
+| `K8S_NAMESPACE` | `agent-apps` | where agent apps are deployed |
+| `NODE_PORT_BASE` / `APP_SLOT_COUNT` | 30000 / 20 | only to **suggest** a NodePort for the manifest the agent writes; the plane allocates the real one |
+| `APP_PORT_BASE` / `APP_PORT_COUNT` | 3000 / 10 | local preview ports, inside the container only (§7) |
 
-Host ports: Roundcube `8080`, SMTP `1025`, IMAP `1143`, apps `3000-3009`.
+**Two variables were deleted and their absence is load-bearing:** `APP_HOST` and
+`PROXY_PORT_BASE` were the halves of `http://{APP_HOST}:{PROXY_PORT_BASE + slot}`, an expression
+that produced a confident URL whether or not anything was listening. There is no expression left
+in [agent_delivery.py](../agent/agent_delivery.py) capable of inventing an address.
 
 ---
 
 ## 11. Deployment and its traps
 
-Authored on the main laptop, deployed to Zeenie over SSH.
+**The repository does not deploy.** Push to `main`, CI builds and tags, the infra/ops side rolls
+the tag onto the pods. That separation exists because the fleet spans two boxes with different
+operating systems and one of them cannot pull an image over SSH at all.
 
-- **`docker pull`/`build` over SSH always fails** with `error getting credentials — A specified
-  logon session does not exist`, even for public images. Docker Desktop's CLI resolves registry
-  credentials through `docker-credential-desktop.exe`, which needs the Windows credential vault;
-  SSH is a *network* logon with no access to it. Emptying `auths`, deleting `credsStore`, a clean
-  `--config` dir and disabling CLI hooks were all tried and all failed. **Fix:**
-  [scripts/deploy-zeenie.cmd](../scripts/deploy-zeenie.cmd) run under the interactive token via
-  `schtasks /IT`. Non-registry commands (`up` on cached images, `ps`, `logs`, `exec`) are fine.
-- **Never bind-mount docker-mailserver's data/state onto a Windows path.** Postfix's `postscreen`
-  dies with SIGSEGV on a missing `postscreen_cache.db` and port 25 silently stops accepting mail
-  **while IMAP still looks healthy**. Use named volumes; bind-mount only `./config/dms/` — which
-  is also what makes the accounts survive a `compose down`.
-- **DMS won't start Dovecot until one account exists**, and shuts down after 120s if none appears.
-- **The healthcheck must test 25 *and* 143.** A 143-only check reports healthy while Postfix is
-  dead — exactly how the bind-mount failure hid itself.
-- **No TLS** (`SSL_TYPE=` empty, plaintext IMAP auth re-enabled via `user-patches.sh`,
-  unauthenticated SMTP relay on `:25` via `PERMIT_DOCKER=connected-networks`). Acceptable on a
-  LAN-only bridge with no internet route; remove the day this gets a certificate.
+- **CI is the gate on the image.** [.github/workflows/agent-runtime.yml](../.github/workflows/agent-runtime.yml)
+  runs every offline suite before it builds. An agent image that boots and misbehaves is worse
+  than one that does not build: it deploys, reports healthy, and spends money doing the wrong
+  thing. `test_faultinject.py` is deliberately excluded — it costs real API calls and has
+  returned opposite verdicts on identical input, and a gate that fails randomly gets ignored.
+- **Three tags are pushed; only a SHA is ever declared.** Full sha, 7-char sha, and `main` for
+  humans. A moving tag turns "restart the pod" into "silently upgrade every agent", and turns a
+  rollback into an argument about what `main` pointed at last Tuesday. Both SHA forms exist
+  because app images use the 7-char convention and a reader who has just learned that will
+  reasonably truncate the runtime tag by hand.
+- **Documentation does not build.** `paths-ignore: ["**/*.md", "docs/**"]`.
+- **`docker pull`/`build` over SSH always fails on zeenie** with `error getting credentials — A
+  specified logon session does not exist`, even for public images: the CLI resolves registry
+  credentials through `docker-credential-desktop.exe`, which needs the Windows credential vault,
+  and SSH is a *network* logon with none. Emptying `auths`, deleting `credsStore`, a clean
+  `--config` dir and disabling CLI hooks were all tried and all failed. Use a `schtasks /IT`
+  task in the interactive session. Non-registry commands over SSH are fine.
+- **`ssh zeenie` lands in cmd.exe; `ssh jay@hp-tiger` lands in a Linux shell.** The same remote
+  command does not work on both.
+- **`docker logs --since` on zeenie takes local time**, so a UTC timestamp silently returns an
+  empty log. Use `--since 60m`.
+- **Docker Desktop on zeenie does not auto-start and has been seen to stop on its own.** The
+  hazard is that it is silent: the agents are not down, they are *absent*, mail queues in
+  Dovecot, and nothing alerts. A watchdog must run in the interactive session and must test the
+  **engine pipe**, not agent liveness. Not built.
+
+### The mail server
+
+Configured in `infra-fleet/mail/` and deployed from there; [mail/README.md](../mail/README.md)
+keeps the reasoning, because every setting is one a reasonable person would "fix" back. Three
+that cost real time:
+
+- **`SSL_TYPE=self-signed` does not make its own certificate.** DMS expects the files to exist
+  and aborts inside TLS setup when they are missing, with no mention of a missing file. Under
+  that mode the **filenames are the configuration**: `<fqdn>-cert.pem`, `<fqdn>-key.pem`,
+  `demoCA/cacert.pem`.
+- **`user-patches.sh` must reach the box with LF endings.** A `\r` on the shebang makes the
+  kernel look for `/bin/bash\r` and the script silently does not run — the server comes up
+  unhardened and nothing reports an error.
+- **Do not set `TLS_VERIFY=true` on the agents** without a certificate they can chain to. Every
+  agent stops receiving mail at once and the symptom reads like a wrong password.
+
+**Historical:** this stack ran as three Docker Compose containers on zeenie until 2026-08.
+`docker-compose.yml`, `provision-agent.ps1`, `scripts/deploy-zeenie.cmd` and `config/` have been
+deleted; recover them from git history if the old shape is ever needed. The trap that mattered
+then and is worth remembering if anyone reintroduces a bind mount: **never bind-mount
+docker-mailserver's data or state onto a Windows path** — `postscreen` dies with SIGSEGV on a
+missing `postscreen_cache.db` and port 25 stops accepting mail *while IMAP still looks healthy*.
 
 ---
 
@@ -610,50 +685,45 @@ arbitrage the whole thesis rests on.
 10. **Memory is a harness feature that the model writes.** Splitting it that way is what makes it
     work: the agent decides what is worth remembering, and the harness guarantees it is read.
 11. **Give the agent a command, not a procedure.** Anything exact and unforgiving — a remote URL
-    with a token in it, a workflow file that must be byte-correct, four Harness API calls in
+    with a token in it, a workflow file that must be byte-correct, a sequence of API calls in
     order — is harness work. `ship_app` exists so the agent chooses *what* to ship and never
-    *how*; the reliability of step 5 stops depending on the model getting a recipe right (§9).
-12. **Autonomy dies at the first manual step.** Per-app Harness pipelines are the right design and
-    also a human clicking through a UI for every app. Automating the clicking rather than
-    abandoning the design kept both (§9).
+    *how*; the reliability of that step stops depending on the model getting a recipe right (§9).
+12. **Autonomy dies at the first manual step.** Per-app deployment pipelines were the right
+    design and also a human clicking through a UI for every app. Automating the clicking rather
+    than abandoning the design kept both — and when that whole toolchain was retired, the habit
+    of automating the click survived it (§9).
 13. **Do not let the agent's own claim be the release.** A `nohup`'d dev server was the agent
-    declaring itself done. Delivery now ends where a human approves, and the agent is required to
-    describe its preview as a preview.
+    declaring itself done. Delivery now ends somewhere the agent does not control, and the agent
+    is required to describe its preview as a preview.
+14. **An agent must never construct an address.** A URL computed from environment variables is
+    produced with equal confidence whether or not anything is listening on it, and an agent that
+    can compute one will email it. Delete the expression, not the mistake (§9).
+15. **Unreadable is not "off".** A missing field, a malformed value or an unreachable control
+    plane must never resolve to "no policy in force". Only the control plane may say zero.
+16. **No verdict is not a pass.** A gate that did not run has approved nothing, and the thing it
+    was gating stays held (§5).
 
 ---
 
 ## 14. Roadmap
 
-> **Superseded for everything past "finishing §9" — see [Fleet-Design.md](Fleet-Design.md).**
-> The items below under *Then* were written for a personal fleet on one laptop. The goal is now a
-> platform other teams can run, and three of those items change shape: "N agents" needs an identity
-> and tenancy model first, "Compose → Kind pods" is deferred behind making the agent stateless
-> (and then wants a Deployment, not a StatefulSet), and per-agent routing must not be decided by
-> an LLM. Fleet-Design.md also corrects §7, §8 and the app-slot mechanism in §9.
+> **Superseded for everything past today's state — see [Fleet-Design.md](Fleet-Design.md) §10.**
+> That document owns the plan; this one owns the machinery. Where they disagree, it wins.
 
-**Finishing §9 — the next work, in order:**
+The chain this section used to describe as "next" is built and running. What remains:
 
-1. **ci-watcher pod** — poll the Actions API for completed runs across `agent-*` repos, emit
-   `ArtifactReady` carrying the app name, image, tag and the committed manifest. Carrying the
-   manifest in the event is what keeps a GitHub token out of governance.
-2. **Governance** — route on `app`: the calculator keeps `HARNESS_PIPELINE`; anything else calls
-   `harness_apps.ensure_app()` then triggers `deploy_agent_<app>`. The approval gate is unchanged,
-   which is the whole point of reusing it.
-3. **Validator** — verify the deployed URL rather than `localhost`, and treat "CI green, awaiting
-   approval" as the finished state instead of failing an app that is not live yet.
-4. **Second email on DEPLOYED** — governance already has a NOTIFY step; point it at the mail
-   server so the release lands in the same thread as the agent's reply.
-
-**Then:**
-
-- **Jira + Confluence** as a second task source and a documentation sink, via Atlassian Cloud
-  free tier. Do **not** self-host Data Center — licences, huge JVMs, a database.
-- **N agents.** The design is already per-container and single-threaded by choice: scale by
-  running more containers, not by adding threads.
-- **Compose → Kind pods** in the existing `learn` cluster (k8s Secrets, Deployments, Services).
-  This is the original "a few containers in the cluster" vision, arriving as step 2 rather than
-  step 1.
-- **App lifecycle.** Nothing retires an app: ten slots, and no path from "deployed" to "deleted"
-  that also cleans up the Harness service, the pipeline, the file-store entries and the repo.
-- **Harden:** long-build handling, app lifecycle beyond container restarts, per-agent identity
-  and routing, and an explicit human approval gate before an agent "ships" anything real.
+1. **The assurance half of cross-review.** Agents can review each other's work; nothing yet
+   *measures* whether the reviews are real. The canary rate, reviewer agreement and a
+   per-reviewer record are the evidence that the gate is not a rubber stamp, and last quarter's
+   canary results cannot be reconstructed after the fact.
+   [tests/test_faultinject.py](../tests/test_faultinject.py) already holds a known-bad artifact;
+   it needs promoting from a test asset to a periodic probe with somewhere to write results.
+2. **A second tenant**, run on the same hardware purely to prove the boundary is enforced by
+   mechanism rather than convention.
+3. **A Docker Desktop watchdog on zeenie** (§11) — the failure mode is silent absence.
+4. **App lifecycle.** Nothing retires an app. There is no path from "deployed" to "deleted" that
+   also cleans up the registration, the Deployment, the Service and the repository.
+5. **Jira and Confluence** as a second task source and a documentation sink, via Atlassian Cloud
+   free tier. Do **not** self-host Data Center — licences, huge JVMs, a database.
+6. **Node 22 → 26** before Node 22 reaches EOL on 2027-04-30. Parked deliberately; prefer 26
+   over 24 by then.

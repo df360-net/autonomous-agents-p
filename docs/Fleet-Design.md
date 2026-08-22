@@ -4,21 +4,24 @@ How the working single-agent system in [Autonomous-Agents-Design.md](Autonomous-
 becomes a platform that other teams can run — **potentially hundreds of agents across a company**,
 on real hardware or public cloud.
 
-The near-term deliverable is small and unchanged: **two agents on Zeenie**. What changes is the
-standard those two are held to. Every decision in phases 1–2 is justified against the end state,
+The near-term deliverable was small and deliberately so: **two agents**, held to the standard of
+a platform. That was delivered and has since grown to four across two boxes, which is exactly the
+test the standard existed to pass. Every decision in phases 1–2 is justified against the end state,
 because the point of this document is not a bigger plan — it is knowing **which decisions are
 cheap now and expensive later**.
 
-*Status: 2026-08-09. **Phase 1 complete; phase 2 all but done.** Built, tested and running on
-Zeenie as **two agents**: D1 (`fleet_identity.py`), D3 (`TaskEnvelope`, `agent_inbox.py`,
-`agent_outbox.py`, `run(envelope)`), D6 (`agent_principal.py`), D7 (`agent_budget.py`) and D5
-(`agent_memory.py`). The cattle test passed on real hardware — agent1's container and its 821MB
+*Status: 2026-08-22. **Phases 1 and 2 are complete**, apart from the assurance half of
+cross-review. Running as **four agents — `dev/agent1` … `dev/agent4` — as Kubernetes pods across
+two boxes**, on `ghcr.io/df360-net/agent-runtime:cc26358`: D1 (`fleet_identity.py`), D3
+(`TaskEnvelope`, `agent_inbox.py`, `agent_outbox.py`, `run(envelope)`), D4 (in effect — the
+control plane allocates, and no agent computes an address), D5 (`agent_memory.py`, remotes on
+GitHub), D6 (`agent_principal.py` + `agent_peer.py`), D7 (`agent_budget.py` +
+`fleet_control.py`). The cattle test passed on real hardware — agent1's container and its 821MB
 workspace volume were destroyed and it came back with all 53,029 bytes of memory byte-identical.
-`dev/agent2` then came up from six lines of compose knowing everything agent1 had learned.
-Outstanding in phase 2: item 7 (preview router) and the rename half of item 8, both of which
-touch live deployments. D2 and D8 are still design. It supersedes §14 (Roadmap) of the
-main design doc and corrects two of its assumptions — see §12. Companion documents:
-[Autonomous-Agents-Design.md](Autonomous-Agents-Design.md) (the system as it exists),
+A second agent then came up knowing everything the first had learned, having been told nothing.
+D2 and D8 are still design. It supersedes §14 (Roadmap) of the main design doc and corrects
+several of its assumptions — see §12. Companion documents:
+[Autonomous-Agents-Design.md](Autonomous-Agents-Design.md) (the machinery as it exists),
 [agent-reminder.md](../agent-reminder.md) (context handoff).*
 
 ---
@@ -340,8 +343,10 @@ cost inside a company is zero.
 
 Mail's problems are **all machine-side**: no authentication that isn't a security system built on
 SMTP, no tenancy, no lease or redelivery semantics, no backpressure, no per-tenant rate limiting,
-unstructured payloads — and on Zeenie specifically, one Postfix with `SPOOF_PROTECTION=0` and
-unauthenticated relay on `:25`.
+unstructured payloads. The two site-specific ones are now fixed: `SPOOF_PROTECTION=1` (with
+`validatorN@` as a send-as alias for `agentN@`, so one login legitimately carries two From
+addresses) and submission on `:587` behind `permit_sasl_authenticated,reject`. The generic
+problems are not fixable at the mail server and are the reason for the table below.
 
 | Path | Transport |
 |---|---|
@@ -353,22 +358,34 @@ unauthenticated relay on `:25`.
 `handle_message` currently fuses IMAP transport, MIME→text parsing, and execution. Split into
 `agent_inbox.py`, `agent_outbox.py`, and `run(envelope)`.
 
-### Previews: the agent must never construct a URL
+### Previews: the agent must never construct a URL — **SETTLED, THE OTHER WAY**
 
-Today `handle_message` interpolates `http://{APP_HOST}:{port}` into the prompt, and
-`agent_delivery.ports_for()` returns a `url`. Ten published host ports per agent does not survive
-hundreds of agents on shared infrastructure.
+The problem was real and worse than described. `handle_message` interpolated
+`http://{APP_HOST}:{port}` into the prompt and `agent_delivery.ports_for()` returned a `url` —
+arithmetic over two environment variables, which produces a confident address whether or not
+anything is listening on it. It did exactly that, in real emails, for apps nothing had deployed.
+Nothing errored and nothing was blank; the sentence was simply false.
 
-Replace both with one call the agent is *told* the answer by:
+The planned fix was `preview.request(app, task_id)` returning a bind port and a routed hostname,
+with one `Host`-header router in front. **That was not built, and is no longer the right shape.**
+What shipped instead is stricter and much smaller:
 
-```python
-preview.request(app, task_id) -> {"bind_port": 8412, "url": "http://todo.agent-01.dev...:3000"}
-```
+- **No agent publishes a host port**, which was the actual requirement. A preview binds inside
+  the agent's own container and is reachable from the agent and its reviewer. Nothing else can
+  reach it, and the agent is told so in the words it needs: *a local port is for testing; never
+  offer it as an address for someone to open.*
+- **`APP_HOST` and `PROXY_PORT_BASE` are deleted**, so there is no expression left in
+  `agent_delivery` capable of inventing an address. Deleting the expression is what makes this
+  durable; a rule about when not to use it would not have been.
+- **The control plane allocates and reports the real address** when an app is registered, and
+  emails it into the agent's own thread once the pod is serving. The agent is *told* the answer,
+  which was the point of `preview.request()` all along — it arrives through registration rather
+  than through a preview router.
 
-The agent binds inside its own container; one router reaches it over the container network and
-routes by `Host` header. On Zeenie that is a small proxy plus wildcard DNS; in cloud it is an
-Ingress — same code path, different resolver. Path-prefix routing (`/p/agent-01/todo/`) is the
-alternative and is worse: it breaks apps with absolute asset paths, which is most of them.
+A `Host`-header router still beats path-prefix routing (`/p/agent-01/todo/` breaks apps with
+absolute asset paths, which is most of them) and remains the answer if named preview
+environments are ever wanted. They are not wanted yet: previews are for the agent's own testing,
+and a preview a human can open is a preview a human will mistake for a release.
 
 ### A2A: three free things now
 
@@ -415,13 +432,21 @@ problem.
 
 ## 8. Safety: the loop guard and the budget
 
-The structural fix matters more than any counter. **Two verbs only:** `review-request` (emitted
-only by a run a human started) and `review-verdict` (terminal — parked, never dispatched). A→B→A
-becomes *unreachable*, not merely improbable. Hop count and thread depth are belts, enforced on
-**envelope fields, never mail headers**.
+The structural fix matters more than any counter, and the shape it settled into is **terminal
+purposes**: a purpose that *answers* something — `answer`, `review-result` — is delivered and
+parked, never dispatched as a new task. A→B→A becomes *unreachable*, not merely improbable. Hop
+count and thread depth are belts, enforced on **envelope fields, never mail headers**.
 
-Every new verb, forever, must state its terminal condition in that table. That is the extension
-point.
+**Every new purpose, forever, must state its terminal condition.** That is the extension point,
+and it was earned: a peer acknowledgement that read as an opening message started a task on
+arrival, and two agents politely acknowledged each other until a counter stopped them.
+
+Above the belts sits a **governance cap the fleet can change without a deploy**:
+`GET /fleet/pause` carries `inter_agent_thread_cap` alongside the kill switch, and
+`agent_principal.admit()` checks it *before* the local ceiling. Two rules keep it honest —
+**only the control plane may say zero**, so a missing or malformed field is not a cap of none;
+and the cap is parsed inside its own `try`, so a bad value can never take the kill switch down
+with it.
 
 Budget per D7, plus a fleet kill switch: when the fleet ceiling trips, intake returns nothing —
 nothing fetched, nothing marked consumed, backlog intact — and one email goes out. Clearable by
@@ -430,6 +455,13 @@ hand at 3am without Docker Desktop running.
 ---
 
 ## 9. Load-bearing on assumptions that break, ranked by cost
+
+> **Scored 2026-08-22.** Items 2, 3, 4, 5 and 12 are **resolved**; 1 is resolved in effect (the
+> plane allocates, so a slot integer is only ever a suggestion in a manifest); 6, 7, 8 and 9
+> stand; 11 is **gone with the toolchain**, and 10 moved rather than disappeared — governance is
+> retired, but the control plane that replaced it now holds the kill switch, the ledger and app
+> allocation behind one token scheme, on one replica. The individual entries below are left as
+> written, because *why* each one was load-bearing is the part worth keeping.
 
 1. **Slot integers** — `agent_delivery` (5 functions), `ship_app._index_for`,
    `agent_app_proxy.mappings`, `cluster.list_apps().slot`, the dashboard, every generated manifest,
@@ -449,14 +481,19 @@ hand at 3am without Docker Desktop running.
     reads only `dep_id`; anyone who can reach `:8091` can approve any deploy), single replica.
 11. **`harness_apps.py`** cloning a pipeline per app — should be one templated pipeline with the
     app as an input.
-12. **docker-mailserver with `SPOOF_PROTECTION=0`** and unauthenticated `:25` — acceptable once
-    mail is only the human interface; disqualifying if mail stays the machine transport.
+12. ~~**docker-mailserver with `SPOOF_PROTECTION=0`** and unauthenticated `:25`~~ — **fixed.**
+    Protection is on, submission on `:587` requires authentication, and `validatorN@` is a
+    send-as alias rather than a second account, so one login legitimately carries two From
+    addresses. The contract that replaced the assumption is written down in `mail/README.md`,
+    because the tempting refactor — select credentials by From address — is exactly the one that
+    would break it.
 
 ---
 
 ## 10. Phases
 
-Phases 1–2 deliver **two agents on Zeenie** and nothing more.
+Phases 1–2 delivered **two agents** and nothing more. Growing to four afterwards cost a
+provisioning command and a pod spec each, which is the acceptance criterion working.
 
 ### Phase 1 — Reshape the primitives (still one agent; no user-visible change) — **COMPLETE**
 
@@ -492,26 +529,48 @@ requester and cost per task.
 6. ✅ Memory → git remote, three scopes; `/workspace` becomes scratch only. *(D5)* — remotes are
    bare repos bind-mounted from the host today, so nothing leaves the laptop; repointing
    `MEMORY_TENANT_REMOTE` at GitHub is a one-line change the agent cannot detect.
-7. `preview.request()` + router + wildcard hostnames; **no agent publishes a host port.**
-8. Kill slot integers; apps addressed `<tenant>/<app>`. *(D4)* — **partially done.** The full
-   rename touches live repos, live deployments and the Harness pipelines, so it is still
-   pending. What shipped is the guard that made a second agent safe without it: `agent-<app>`
-   is a fleet-wide name, so two agents asked to build "a todo list" resolve to the same
-   repository and the second silently overwrites the first's running application. `ship_app`
-   now records the owning agent in the repo and refuses a push from anyone else.
-9. ✅ Stand up `dev/agent2` — six lines of compose, one `provision-agent.ps1` run. Nothing
-   else. *That is the test that phases 1–2 worked, and it passed:* agent2 came up with 32,865
-   bytes of agent1's machine knowledge already in its memory, its own empty inventory, a
-   derived identity with zero conflicts, and all eight suites green — having been told nothing.
+7. ✅ **No agent publishes a host port** — settled without the router. `APP_HOST` and
+   `PROXY_PORT_BASE` are deleted, the plane allocates and reports the address, and a preview is
+   for the agent's own testing only. See §6, which records why the planned shape was dropped.
+8. ✅ **Slot integers no longer allocate anything** *(D4)* — the control plane assigns the box,
+   the NodePort and the URL, so the number in a committed manifest is a plausible description of
+   the app rather than a claim on a global namespace, and a collision is impossible rather than
+   unlikely. **The `<tenant>/<app>` rename is still not done**, and the guard that makes a fleet
+   safe without it is: `agent-<app>` is a fleet-wide name, so two agents asked to build "a todo
+   list" resolve to the same repository and the second would silently overwrite the first's
+   running application. `ship_app` records the owning agent and refuses a push from anyone
+   else.
+9. ✅ Stand up a second agent. *That is the test that phases 1–2 worked, and it passed:* it came
+   up with 32,865 bytes of the first agent's machine knowledge already in its memory, its own
+   empty inventory, a derived identity with zero conflicts, and every suite green — having been
+   told nothing. **There are now four**, and adding one is `provision_agent.py <name> | kubectl
+   apply -f -` plus a pod spec: the provisioner mints the mailbox password, prints it once into
+   a Secret, and forgets it.
 10. Cross-review via control-plane relay, with the canary, recorded per reviewer from review one.
-    **Partially done:** agents can now ask each other for a review over signed mail
-    (`agent_peer.py`), which is the capability. What is missing is the *assurance* half — the
-    canary rate, the reviewer-agreement rate and the per-reviewer record. Those need somewhere to
-    write them, which is the control plane.
+    **Partially done, and this is the last open item in phase 2.** Agents can ask each other for
+    a review over signed mail (`agent_peer.py`), and the in-container gate's verdict now reaches
+    the control plane and withholds the announcement on a fail or on silence. What is still
+    missing is the *assurance* half — the canary rate, the reviewer-agreement rate and the
+    per-reviewer record.
 
-**Acceptance — the cattle test, run at N=2:**
-`docker compose rm -f -v agent-02 && docker compose up agent-02` and it returns with all its
-memory, its assets and its identity.
+    A severity ladder has been measured since this was written, 8 runs per rung: a leaked-secret
+    defect was caught 8/8, and correct work was passed 8/8 with no false FAILs. That is
+    encouraging and it is not the canary — it was run by hand, once, and nothing records the
+    rate over time. **Last quarter's catch rate cannot be reconstructed after the fact**, which
+    is the whole argument for recording from review one.
+
+    One negative result belongs here too. A tripwire that re-checked any PASS carrying hedging
+    language was built and then **unwired, because it fired on 3 of 8 correct passes** — a 37%
+    tax on good work. It survives as a measurement instrument (`hedged_pass()`), not as a gate.
+    A cheap heuristic in front of a real reviewer has to be measured against correct work before
+    it is trusted, not only against bad work.
+
+**Acceptance — the cattle test, run at N=2: PASSED.** Destroy an agent's container and its
+workspace volume, recreate it, and it returns with all its memory, its assets and its identity.
+It was run on Compose (`docker compose rm -f -v` then `up`) and the pod-era equivalent is
+`kubectl delete pod` plus deleting the workspace volume — a weaker test, since the pod is
+already recreated from an image on every roll. The 821MB workspace destruction is the version
+that proved it.
 
 ### Phase 3 — Control-plane shape (still 2 agents; a second tenant becomes possible)
 
@@ -526,9 +585,12 @@ nicety.
 
 ### Phase 4 — Off the laptop, and rolling upgrade
 
-Real hardware or cloud; **Deployment, not StatefulSet**; retire `agent_app_proxy.py`, the
-`schtasks` deploy, the LAN IP and the `.local` mail domain; real Ingress; one templated Harness
-pipeline replaces per-app clones.
+**Largely done ahead of schedule, and not by plan.** Agents are Kubernetes pods built from a
+published image, rolled by declaring a SHA; the Compose stack and its `provision-agent.ps1` are
+deleted. What remains of this phase: retire `agent_app_proxy.py` (still in the tree because the
+two boxes differ in whether a NodePort needs republishing), the `schtasks` deploy on zeenie, the
+LAN IP and the `.local` mail domain; a real Ingress; and the rolling-upgrade acceptance below,
+which has **not** been tested with tasks in flight.
 
 **Acceptance:** roll a new agent image across the fleet with tasks in flight. Every in-flight task
 either completes or shows as `abandoned` with a retry decision. Nothing vanishes.
@@ -599,9 +661,16 @@ humans are actually mis-routing.
 
 - **§14 Roadmap** is superseded by §10 here.
 - **§8 (memory)** assumes two scopes in a container volume. Both change: three scopes, external git.
-- **§9 (delivery)** is built on the app-slot integer, which D4 removes. The chain itself — GitHub →
-  Actions → ci-watcher → Kafka → governance approval → Harness → cluster — is unchanged and stays.
-- **§7 (local previews)** assumes published host ports. §6 here replaces that with name addressing.
+- **§9 (delivery)** was built on the app-slot integer, which D4 removes. **The chain it described
+  is gone**: Kafka → ci-watcher → governance approval → Harness has been retired, and delivery is
+  now GitHub → Actions → ghcr → `ship_app register` → the fleet control plane → a per-box daemon.
+  The *shape* survived the tooling — an image built by CI, a deploy performed by something that
+  is not the agent, an address the agent is told rather than computes, and a human able to
+  withhold the release. §9 has been rewritten to match.
+- **§7 (local previews)** assumed published host ports. Nothing publishes a pod's ports; a preview
+  is reachable from the agent and its reviewer and from nowhere else. §7 has been rewritten, and
+  the sentence that mattered most is now in the fleet-wide `FLEET.md` as well, because an agent
+  offering a local port as an address hands a human a dead link with complete confidence.
 - The principle list in **§13 stands unchanged**, and this document is an application of it. One
   addition earned here: *deferring a feature is cheap; deferring the seam that makes the feature
   possible is how a rewrite gets scheduled.*
