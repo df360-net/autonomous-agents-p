@@ -36,5 +36,5 @@ Two consequences worth knowing:
 
 Operator tooling stays at the repo root, because it runs on a host and not in the container:
 `provision_agent.py` (creates a mailbox, prints a k8s Secret), `scripts/task_agent.py`, the
-`Dockerfile` and `docker-compose.yml`, and `mail/` (reasoning only — the mail config itself
+the `Dockerfile`, and `mail/` (reasoning only — the mail config itself
 lives in `infra-fleet/mail/` and auto-deploys from there).

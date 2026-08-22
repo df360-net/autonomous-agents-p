@@ -4,10 +4,27 @@
 > truth for what we're building, the decisions already locked, the runtime environment, how the
 > user works, and exactly where we are. Written 2026-08-01.
 >
-> **Currency warning (2026-08-09).** §§1-6 and 9 still hold. §7 is rewritten below. §§8, 10 and
-> 11 describe subsystems that have since been rebuilt — each now carries a note saying what
-> changed. The current plan and its status live in
-> [docs/Fleet-Design.md](docs/Fleet-Design.md); when that and this disagree, that one wins.
+> **CURRENCY WARNING (2026-08-22) — READ THIS BEFORE §5 OR §7.** The runtime described below is
+> gone. This document was written for a Docker-Compose stack on one Windows box; the fleet now
+> runs as Kubernetes pods on two boxes, tasked through a mail server on hp-tiger and governed by
+> a fleet control plane that owns ports, deploys, spend and the kill switch.
+>
+> Specifically **retired, and the files deleted from this repo**: `docker-compose.yml`,
+> `provision-agent.ps1`, `scripts/deploy-zeenie.cmd`, `config/dms/`, `config/roundcube/`, and
+> the Kafka / ci-watcher / Harness delivery chain. Where a section below tells you to run or
+> edit one of those, it is describing history. Recover any of them from git history if needed.
+>
+> **What is true now:** agents are pods built from `ghcr.io/df360-net/agent-runtime:<short-sha>`
+> and rolled by the infra/ops agent; mailboxes come from `provision_agent.py` (prints a k8s
+> Secret); mail config lives in `infra-fleet/mail/` under CD, with the reasoning kept in
+> [mail/README.md](mail/README.md); the agent's own code is in [agent/](agent/).
+>
+> §§1-4, 6 and 9 still hold — the vision, the locked decisions and how the user works did not
+> change. §5 (environment) and §7 (where we are) are historical. The current plan and status
+> live in [docs/Fleet-Design.md](docs/Fleet-Design.md); when that and this disagree, that wins.
+>
+> This file has not been rewritten to match — it is a 2026-08-01 handoff with a 2026-08-22
+> banner, and a rewrite is the honest fix.
 
 ---
 

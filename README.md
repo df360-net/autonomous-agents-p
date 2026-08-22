@@ -10,112 +10,38 @@ Context, decisions and roadmap: [agent-reminder.md](agent-reminder.md).
 
 | file | what it is |
 |---|---|
-| [agent_brain.py](agent_brain.py) | `../LLM_API_call/agent.py`'s loop, talking straight to DeepSeek, every tool auto-approved (the container is the sandbox). Returns a structured result instead of printing. |
-| [agent_validator.py](agent_validator.py) | The review gate. Same loop, reviewer's prompt, fresh context, its own shell. Nothing is sent until it signs off (or 3 rounds are spent). |
-| [agent_notes.py](agent_notes.py) | The agent's memory between tasks: pastes its three self-written notes files (`AGENT.md`, `AGENT-ASSETS.md`, `AGENT-AVOID.md`) into every task, and finds an app port nothing is listening on. |
-| [agent_delivery.py](agent_delivery.py) | Delivery conventions: `agent-<app>` repos, `ghcr.io/<owner>/agent-<app>` images, three ports per app slot, and the CI + manifest templates. |
-| [ship_app.py](ship_app.py) | On PATH in the container as `ship_app`. `scaffold` / `push` / `status` / `logs` / `list` — the agent's only route to GitHub. Needs `GITHUB_TOKEN` with `repo` **and** `workflow` scope. |
-| [agent_app_proxy.py](agent_app_proxy.py) | Runs on the `kind` docker network on Zeenie; republishes NodePorts `30000-30009` as `31000-31009` so a deployed pod opens in a browser. |
-| [agent_worker.py](agent_worker.py) | The I/O adapter: poll IMAP → run the task in its own workspace → review → reply over SMTP. |
+| [agent/agent_brain.py](agent/agent_brain.py) | The loop, talking straight to DeepSeek, every tool auto-approved (the container is the sandbox). Returns a structured result instead of printing. |
+| [agent/agent_validator.py](agent/agent_validator.py) | The review gate. Same loop, reviewer's prompt, fresh context, its own shell. Nothing is sent until it signs off (or the rounds are spent). |
+| [agent/agent_notes.py](agent/agent_notes.py) | The agent's memory between tasks: pastes its self-written notes into every task, and finds a preview port nothing is listening on. |
+| [agent/agent_delivery.py](agent/agent_delivery.py) | Delivery conventions: `agent-<app>` repos, `ghcr.io/<owner>/agent-<app>` images, and the CI + manifest templates. |
+| [agent/ship_app.py](agent/ship_app.py) | On PATH in the container as `ship_app`. `scaffold` / `push` / `status` / `logs` / `list` — the agent's only route to GitHub, and where an app is registered with the fleet. |
+| [agent/agent_principal.py](agent/agent_principal.py) | Who is allowed to task this agent, hop budgets, and the attestation that makes agent-to-agent mail trustworthy. |
+| [agent/fleet_control.py](agent/fleet_control.py) | Client for the fleet control plane: the kill switch, the spend ceiling and the inter-agent thread cap. Fails closed. |
+| [agent/agent_worker.py](agent/agent_worker.py) | The I/O adapter: poll IMAP → run the task in its own workspace → review → reply over SMTP. The container's entrypoint. |
+| [agent/](agent/) | Everything else that runs in the container, and why the image layout is flat. |
 | [Dockerfile](Dockerfile) | python 3.12 + node 22 + tsc + git — enough for the agent to actually build software. |
-| [docker-compose.yml](docker-compose.yml) | docker-mailserver + Roundcube + the worker, on one bridge. |
+| [provision_agent.py](provision_agent.py) | Creates an agent's mailbox on the mail host and prints a k8s Secret, so the password never lands in a file. |
 
-## Deploy to Zeenie
+## How it is deployed
 
-Zeenie is the runtime. Author here, run there.
+**Nothing here deploys the fleet, and that is deliberate.** Pushing to `main` builds
+`ghcr.io/df360-net/agent-runtime:<short-sha>` in CI, and the infra/ops side rolls the agents
+onto a tag. The agents run as Kubernetes pods on two boxes, take their tasks from the mail
+server on hp-tiger, and get their ports, deploys, spend ceiling and kill switch from the fleet
+control plane.
 
-**0. Zeenie must be ready.** After a Windows reboot two things bite (see
-`agent-reminder.md` §5): the Wi-Fi profile flips to Public and firewalls port 22, and Docker
-Desktop does not auto-start — click its icon.
+So the loop is: commit → CI builds and tags → tell the infra side the tag → they roll it.
+A green build is not a deployed fix; check what the pods are actually running.
 
-**1. Copy the project over** (from this laptop):
-
-```powershell
-ssh zeenie "mkdir C:\Users\jianm\autonomous-agents"
-scp -r agent_brain.py agent_delivery.py agent_notes.py agent_validator.py agent_worker.py `
-       ship_app.py Dockerfile docker-compose.yml config zeenie:C:/Users/jianm/autonomous-agents/
-```
-
-**2. Create `.env` on Zeenie** — never commit or echo the key:
-
-```powershell
-ssh zeenie
-notepad C:\Users\jianm\autonomous-agents\.env    # copy .env.example, fill in DEEPSEEK_API_KEY + passwords
-```
-
-**3. Start the mail server and create the two mailboxes.** On a first-ever start there is a
-deadline: docker-mailserver refuses to start Dovecot until at least one account exists, and
-it shuts itself down after **120 seconds** if none appears. Have these commands ready:
-
-```
-cd C:\Users\jianm\autonomous-agents
-docker compose up -d mailserver
-docker exec mailserver setup email add boss@agents.local <BOSS_PASSWORD>
-docker exec mailserver setup email add agent1@agents.local <AGENT1_PASSWORD>
-docker exec mailserver setup email add validator1@agents.local <VALIDATOR1_PASSWORD>
-docker exec mailserver setup email list
-```
-
-`validator1` only ever *sends* (the reviewer's sign-off), so the worker never needs its
-password — but give it a real mailbox anyway so replies to it don't bounce.
-
-The passwords must match `.env`. The accounts land in `config/dms/postfix-accounts.cf`, which
-is bind-mounted from this repo — so they survive `docker compose down` even though the mail
-store (a named volume) does not. Prove auth works before going further:
-
-```
-docker exec mailserver doveadm auth test agent1@agents.local <AGENT1_PASSWORD>
-```
-
-**4. Bring up the rest.** Anything that touches a registry (`pull`, `build`) **cannot be run
-over SSH** on Zeenie: Docker Desktop's CLI resolves credentials through
-`docker-credential-desktop.exe`, which needs the Windows credential vault, and an SSH session
-is a network logon with no access to it — so even anonymous public pulls die with
-`A specified logon session does not exist`. Emptying `auths`, deleting `credsStore`, using a
-clean `--config` dir and disabling CLI hooks were all tried; none work. Run it under the
-logged-in interactive token instead (one-time setup):
-
-```
-schtasks /create /tn agents-deploy /tr C:\Users\jianm\autonomous-agents\deploy-zeenie.cmd /sc once /st 00:00 /ru jianm /it /f
-```
-
-then, any time you need to build or pull:
-
-```
-ssh zeenie "schtasks /run /tn agents-deploy"     # see scripts/deploy-zeenie.cmd
-ssh zeenie "type C:\Users\jianm\autonomous-agents\deploy.log"
-```
-
-Everything that does *not* hit a registry — `compose up` on cached images, `ps`, `logs`,
-`exec` — works fine over plain SSH:
-
-```
-docker compose logs -f agent-worker
-```
-
-**5. Use it.** Open `http://192.168.0.105:8080`, log in as `boss@agents.local`, and email
-`agent1@agents.local`:
-
-> Subject: Build a tic-tac-toe web app
-> Two players, no framework, runs from a single HTML file. Reply when done.
-
-Watch `docker compose logs -f agent-worker` while it works. The reply lands in the boss
-inbox: the agent's own summary first, then the evidence — files written and every command
-it ran, so you can read the diff instead of trusting a green tick.
-
-Inspect what it built:
-
-```
-docker exec -it agent1 bash -lc "ls /workspace"
-docker cp agent1:/workspace/task-0001-build-a-tic-tac-toe-web-app ./out
-```
-
+The Docker-Compose stack that used to run all of this on one Windows box has been retired and
+its files removed (`docker-compose.yml`, `provision-agent.ps1`, `scripts/deploy-zeenie.cmd`,
+`config/`). Recover them from git history if you ever need the old shape.
 ## Run it without any of that
 
 The brain is standalone — useful for a quick check that DeepSeek and the tool loop are fine:
 
 ```powershell
-$env:WORKSPACE="C:\tmp\ws"; python agent_brain.py "write add.py with a test"
+$env:WORKSPACE="C:\tmp\ws"; python agent/agent_brain.py "write add.py with a test"
 ```
 
 `python agent/agent_worker.py --once` does exactly one poll cycle and exits (inside the container it is `python agent_worker.py`, since the image copies the modules flat into `/app`).
