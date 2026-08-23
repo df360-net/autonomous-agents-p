@@ -368,13 +368,12 @@ def check():
             f"{AGENT_ID} has spent ${day:.2f} in the last 24h, at its ${cap['daily']:.2f} "
             f"ceiling (AGENT_DAILY_USD)."
         )
-    # THE FLEET CEILING, WHEN THE FLEET IS NOT ON ONE BOX. Two checks, in the order that costs
-    # least to be wrong about.
+    # THE CONTROL PLANE'S CEILING, WHICH IS PER AGENT AND NOT FLEET-WIDE. Three checks, in the
+    # order that costs least to be wrong about: is our copy of the plane's view hopelessly
+    # stale, are we over the ceiling it set, and does the plane itself say we are over.
     #
-    # First the latch: a spend that could not be recorded is a spend nobody is counting, and
-    # continuing past it means the ceiling is being checked against a total that is already
-    # known to be short. Refusing here is the fail-closed half of the ledger migration, and
-    # this is the first moment in the call path where refusing prevents anything.
+    # None of them makes a network call. The ceiling and the 24h total arrive on the same 60s
+    # poll as the kill switch, which is what took the money gate off the per-call path.
     if fleet_control.enabled():
         view = fleet_control.spend_view()
         over, total, ceiling = view["over"], view["total"], view["ceiling"]
@@ -395,8 +394,36 @@ def check():
                 f"workspace and the spend is in this agent's local ledger. This clears itself "
                 f"as soon as the plane answers; no restart is needed."
             )
-        # Then the plane's own verdict. `over` is computed there against the authoritative
-        # total across every agent, which is the number a per-box file cannot see.
+        # THE PLANE'S CEILING, CHECKED AGAINST A TOTAL THE PLANE CANNOT SEE YET.
+        #
+        # `over` below is the plane's own verdict, and it is only ever computed over spend that
+        # has actually been PUSHED. That was the whole exposure: infra found agent1 with zero
+        # records lifetime, which means its `over` had been vacuously false the entire time —
+        # an agent could run past its ceiling all day and the flag would never flip, because
+        # the flag is computed from a ledger nothing was reaching.
+        #
+        # So the ceiling is now enforced HERE, against the reconciled number:
+        #
+        #     what the plane has counted  +  what we still owe it   vs   the local ledger
+        #
+        # and whichever is larger wins. The first term survives a pod restart, which the local
+        # ledger does not — /workspace is scratch, so a fresh pod starts its ledger at zero and
+        # a restart would otherwise be a way to clear a ceiling. The second term covers spend
+        # the drainer has not delivered. Taking the max can over-count a little and cannot
+        # under-count, which is the only direction that is safe for a ceiling.
+        plane = fleet_control.plane_budget()
+        if plane["known"] and plane["ceiling"] is not None:
+            reconciled = max(day, (plane["total_24h"] or 0.0) + view["pending_usd"])
+            if reconciled >= plane["ceiling"]:
+                pause(f"{AGENT_ID} has spent ${reconciled:.2f} of its ${plane['ceiling']:.2f} "
+                      f"ceiling from the fleet control plane, tripped on task {task_id}.")
+                raise BudgetExceeded(
+                    f"{AGENT_ID} has spent ${reconciled:.2f} in the last 24h, at the "
+                    f"${plane['ceiling']:.2f} ceiling set by the fleet control plane. Work "
+                    f"already done is in the workspace."
+                )
+        # Then the plane's own verdict, kept as a second opinion. It is computed from pushed
+        # spend only, so it can lag the check above; it can never be ahead of it.
         if over:
             pause(f"the fleet control plane reports {AGENT_ID} over its ceiling "
                   f"(${total} of ${ceiling}), tripped on task {task_id}.")

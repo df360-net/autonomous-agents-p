@@ -53,8 +53,10 @@ class Plane:
         self.over = False
         self.status = 200
         self.spend_status = None                       # set to 503 to break POST /fleet/spend
-        self.hits = {"pause": 0, "spend": 0, "settings": 0}
+        self.hits = {"pause": 0, "spend": 0, "settings": 0, "status": 0}
         self.settings = {"inter_agent_thread_cap": 8}
+        self.has_status = True                         # False = a plane that predates it
+        self.budget = {"spend_ceiling": 10.0, "your_total_24h": 0.0, "over": False}
         self.last_body = None
         self.last_auth = None
         outer = self
@@ -73,13 +75,27 @@ class Plane:
 
             def do_GET(self):
                 outer.last_auth = self.headers.get("Authorization")
+                if self.path.startswith("/fleet/status"):
+                    # An OLDER plane does not have this endpoint. The catch-all below used to
+                    # answer it 200 with an unrelated body, which is worse than a 404 in a
+                    # test: the client cannot tell a missing endpoint from a working one, and
+                    # every assertion about the kill switch passed while reading a body that
+                    # never mentioned `paused`.
+                    if not outer.has_status:
+                        return self._reply({"error": "not found"}, 404)
+                    outer.hits["status"] += 1
+                    outer.hits["pause"] += 1          # it is the poll, whatever it is called
+                    return self._reply({"paused": outer.paused, **outer.settings,
+                                        **outer.budget})
                 if self.path.startswith("/fleet/pause"):
                     outer.hits["pause"] += 1
                     return self._reply({"paused": outer.paused, **outer.settings})
                 if self.path.startswith("/settings"):
                     outer.hits["settings"] += 1
                     return self._reply(outer.settings)
-                return self._reply({"total": 0}, 200)
+                if self.path.startswith("/fleet/spend"):
+                    return self._reply({"agent": "dev/agent1", "total": 0})
+                return self._reply({"error": "not found"}, 404)
 
             def do_POST(self):
                 outer.last_auth = self.headers.get("Authorization")
@@ -421,6 +437,111 @@ except agent_budget.BudgetExceeded:
     recovered = False
 check("and once the queue drains the agent works again, with no restart", recovered)
 agent_budget.SPEND_GRACE = 300
+
+
+# ---- /fleet/status: one poll, and a rollout that cannot brick the fleet ---------------------
+print("\n--- /fleet/status ---")
+use(plane.url)
+plane.has_status = True
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 4.0, "over": False}
+fleet_control._status_path["path"] = "/fleet/status"
+before = plane.hits["status"]
+fleet_control.paused()
+b = fleet_control.plane_budget()
+check("the ceiling and the 24h total ride in on the kill-switch poll",
+      plane.hits["status"] - before == 1 and b["ceiling"] == 10.0 and b["total_24h"] == 4.0,
+      str(b))
+check("  ...so reading the ceiling costs no extra request",
+      fleet_control.plane_budget()["ceiling"] == 10.0 and plane.hits["status"] - before == 1)
+
+# UNREADABLE IS NOT "OFF", AND NULL IS NOT MISSING. Three states, and the middle one is the
+# only one a plane may use to mean unlimited.
+plane.budget = {"spend_ceiling": None, "your_total_24h": 4.0, "over": False}
+use(plane.url)
+fleet_control.paused()
+b = fleet_control.plane_budget()
+check("an explicit null ceiling means UNLIMITED — the plane said so",
+      b["known"] is True and b["ceiling"] is None, str(b))
+
+plane.budget = {}                                   # the field is simply absent
+use(plane.url)
+fleet_control.paused()
+b = fleet_control.plane_budget()
+check("an ABSENT ceiling is 'the plane did not say', not 'unlimited'",
+      b["known"] is False, str(b))
+
+# The rollout guard. An agent on the new image meeting a plane without the endpoint must keep
+# working: unreachable means PAUSED, so a 404 read as an outage would stop the fleet on a
+# routine deploy.
+plane.has_status = False
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 0.0, "over": False}
+use(plane.url)
+fleet_control._status_path["path"] = "/fleet/status"
+p, reason = fleet_control.paused()
+check("a plane with no /fleet/status does NOT read as unreachable", p is False, reason)
+check("  ...the kill switch still works through the fallback",
+      fleet_control._status_path["path"] == "/fleet/pause")
+check("  ...the thread cap still arrives", fleet_control.inter_agent_thread_cap() == 8)
+check("  ...and the ceiling is simply unknown, so local limits apply unchanged",
+      fleet_control.plane_budget()["known"] is False)
+plane.has_status = True
+fleet_control._status_path["path"] = "/fleet/status"
+
+# ---- The ceiling is enforced against a number a restart cannot reset ------------------------
+# /workspace is scratch: a fresh pod starts its local ledger at zero. If the ceiling were
+# checked against the local ledger alone, restarting an agent would clear its ceiling. And it
+# cannot be checked against the plane's total alone either, because that counts only what has
+# been PUSHED — infra found agent1 with zero records lifetime, which means its `over` had been
+# vacuously false the whole time.
+print("\n--- the ceiling survives a restart, and does not wait for the push ---")
+use(plane.url)
+try:
+    os.remove(os.environ["FLEET_PAUSE_FILE"])
+except OSError:
+    pass
+fleet_control.flush_spend(timeout=10)
+plane.over = False
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 9.5, "over": False}
+fleet_control.paused()
+agent_budget.start_task("task-0002-test", requester="boss@agents.local")
+try:
+    agent_budget.check()
+    check("under the ceiling on the plane's own number, work continues", True)
+except agent_budget.BudgetExceeded as e:
+    check("under the ceiling on the plane's own number, work continues", False, str(e))
+
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 10.5, "over": False}
+use(plane.url)
+fleet_control.paused()
+try:
+    agent_budget.check()
+    check("A RESTART CANNOT CLEAR THE CEILING — an empty local ledger is not zero spend",
+          False, "did not raise")
+except agent_budget.BudgetExceeded as e:
+    check("A RESTART CANNOT CLEAR THE CEILING — an empty local ledger is not zero spend", True)
+    check("  ...and the plane's ceiling is named as the one that stopped it",
+          "fleet control plane" in str(e), str(e))
+
+# And the other half: spend that has NOT reached the plane still counts against the ceiling,
+# which is the hole `over` alone left open.
+try:
+    os.remove(os.environ["FLEET_PAUSE_FILE"])
+except OSError:
+    pass
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 9.0, "over": False}
+use(plane.url)
+fleet_control.paused()
+plane.spend_status = 503
+fleet_control.queue_spend("dev/agent1", 2.0, detail="task-0002-test")
+try:
+    agent_budget.check()
+    check("unpushed spend counts against the ceiling too — `over` alone cannot see it",
+          False, "did not raise")
+except agent_budget.BudgetExceeded:
+    check("unpushed spend counts against the ceiling too — `over` alone cannot see it", True)
+plane.spend_status = None
+fleet_control.flush_spend(timeout=10)
+plane.budget = {"spend_ceiling": 10.0, "your_total_24h": 0.0, "over": False}
 
 print("\n" + ("ALL FLEET CONTROL TESTS PASSED" if all_ok else "SOME TESTS FAILED"))
 plane.stop()

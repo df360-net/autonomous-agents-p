@@ -73,6 +73,19 @@ def enabled():
     return bool(BASE_URL)
 
 
+class FleetHTTPError(OSError):
+    """An HTTP status the plane actually returned, as opposed to a network failure.
+
+    A subclass of OSError so every existing `except OSError` still catches it — the only
+    caller that looks at `.code` is the one deciding whether this plane is old enough to be
+    missing an endpoint. The message never contains the token; see `_request`.
+    """
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 def _request(method, path, payload=None):
     """One HTTP call. Raises on anything that is not a 2xx with a JSON body.
 
@@ -95,11 +108,66 @@ def _request(method, path, payload=None):
                 raise OSError(f"{method} {path} -> HTTP {resp.status}")
             return json.loads(body or "{}")
     except urllib.error.HTTPError as e:
-        raise OSError(f"{method} {path} -> HTTP {e.code}") from None
+        raise FleetHTTPError(f"{method} {path} -> HTTP {e.code}", e.code) from None
     except urllib.error.URLError as e:
         raise OSError(f"{method} {path} -> unreachable ({e.reason})") from None
     except (ValueError, TimeoutError) as e:
         raise OSError(f"{method} {path} -> bad response ({e})") from None
+
+
+# ---- One poll, everything the plane decides ----------------------------------
+# /fleet/status is a strict superset of /fleet/pause: {paused, inter_agent_thread_cap,
+# spend_ceiling, your_total_24h, over}. Reading it on the cadence the kill switch already runs
+# on is what takes the money gate off the per-call path — the ceiling stops being a side effect
+# of a log write and becomes a policy this agent is told, once a minute.
+#
+# THE FALLBACK IS NOT TIDINESS, IT IS THE ROLLOUT. Agents roll one at a time, and an unreachable
+# plane means PAUSED. Without this, an agent carrying the new image that met a plane without the
+# endpoint would read the 404 as "cannot reach the control plane" and stop working — the whole
+# fleet, quietly, on a routine deploy. One 404 demotes this process to /fleet/pause for good.
+_status_cache = {"at": 0.0, "value": None}
+_status_path = {"path": "/fleet/status"}
+
+
+def _fetch_status():
+    path = _status_path["path"]
+    try:
+        return _request("GET", path)
+    except FleetHTTPError as e:
+        if path != "/fleet/pause" and e.code in (404, 405, 501):
+            log(f"this control plane has no {path} (HTTP {e.code}) — falling back to "
+                f"/fleet/pause, so the kill switch and the thread cap keep working while the "
+                f"per-agent ceiling stays local")
+            _status_path["path"] = "/fleet/pause"
+            return _request("GET", "/fleet/pause")
+        raise
+
+
+def plane_budget():
+    """The plane's per-agent money policy, from the poll the kill switch already made.
+
+    Returns {known, ceiling, total_24h, over, age}. THREE STATES, NOT TWO, and conflating any
+    two of them is the bug this shape exists to prevent:
+
+      - the field is ABSENT      -> the plane did not say. `known` is False and the local
+                                    ceilings are all that apply, exactly as before.
+      - the field is null        -> the plane said UNLIMITED. Only the plane may say that.
+      - the field is a number    -> that is the ceiling.
+
+    `age` is how stale the answer is. Nobody needs to fail closed on it here, because an
+    unreachable plane has already stopped this agent through `paused()`.
+    """
+    with _lock:
+        answer, at = _status_cache["value"], _status_cache["at"]
+    if not answer or "spend_ceiling" not in answer:
+        return {"known": False, "ceiling": None, "total_24h": None, "over": False, "age": None}
+    raw = answer.get("spend_ceiling")
+    total = answer.get("your_total_24h")
+    return {"known": True,
+            "ceiling": None if raw is None else float(raw),
+            "total_24h": None if total is None else float(total),
+            "over": bool(answer.get("over")),
+            "age": time.time() - at}
 
 
 # ---- The kill switch ---------------------------------------------------------
@@ -118,22 +186,24 @@ def paused():
                 return True, "the fleet control plane says the fleet is paused (cached)"
             return False, ""
     try:
-        answer = _request("GET", "/fleet/pause")
+        answer = _fetch_status()
     except OSError as e:
         # THE IMPORTANT BRANCH. No answer is not "carry on".
         _log_state("unreachable", f"cannot reach the fleet control plane ({e}) — treating the "
                                   f"fleet as PAUSED until it answers")
         return True, f"the fleet control plane is unreachable ({e}), so work is paused"
     is_paused = bool(answer.get("paused"))
-    # The thread cap rides on this same response, so read it while we have it. Deliberately
-    # tolerant: a plane that has not been upgraded yet simply omits the field, and that must
-    # leave the kill switch working rather than turning a governance change into an outage.
+    # Everything else the plane decides rides on this same response, so read it while we have
+    # it. Deliberately tolerant: a plane that has not been upgraded yet simply omits a field,
+    # and that must leave the kill switch working rather than turning a governance change into
+    # an outage.
     try:
         _cap_from(answer, now)
     except (TypeError, ValueError) as e:
-        log(f"ignoring a malformed inter_agent_thread_cap on /fleet/pause ({e})")
+        log(f"ignoring a malformed inter_agent_thread_cap ({e})")
     with _lock:
         _pause_cache.update(at=now, paused=is_paused)
+        _status_cache.update(at=now, value=answer)
     _log_state("paused" if is_paused else "running",
                "the fleet control plane says PAUSED" if is_paused
                else "fleet control plane reachable, not paused")
@@ -172,7 +242,7 @@ def inter_agent_thread_cap():
         if now - _settings_cache["at"] < PAUSE_TTL and _settings_cache["value"] is not None:
             return _settings_cache["value"]
     try:
-        return _cap_from(_request("GET", "/fleet/pause"), now)
+        return _cap_from(_fetch_status(), now)
     except (OSError, TypeError, ValueError) as e:
         log(f"cannot read inter_agent_thread_cap ({e}) — using the default of "
             f"{DEFAULT_THREAD_CAP}")
