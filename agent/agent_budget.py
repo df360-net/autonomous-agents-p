@@ -84,9 +84,11 @@ PRICE_OUTPUT_PER_M = float(os.environ.get("PRICE_OUTPUT_PER_M", "1.10"))
 
 _lock = threading.Lock()
 _task = {"id": None, "requester": None, "usd": 0.0}
-# What the control plane last told us, and whether the last write to it landed. `broken` is the
-# fail-closed latch: set when a spend could not be recorded, cleared by the next one that can.
-_remote = {"broken": None, "over": False, "total": None, "ceiling": None}
+# How long spend may sit unpushed before this agent stops taking new calls. Generous on
+# purpose: the failure it guards against is a plane that has stopped counting, which is a
+# slow problem, while the failure it must NOT cause is stopping work over a blip, which is a
+# fast one. Five minutes is far longer than any transient timeout and far shorter than a night.
+SPEND_GRACE = float(os.environ.get("AGENT_SPEND_GRACE", "300"))
 _recent = {"path": None, "at": 0.0, "usd": 0.0}   # memoised 24h total, see _spent_24h
 RECENT_TTL = float(os.environ.get("BUDGET_RECENT_TTL", "30"))
 
@@ -171,24 +173,13 @@ def record(usage, model=None, role="worker"):
     # the spend is still on disk here and can be reconciled later; losing the record entirely
     # because a remote was unreachable would be the worst of both designs.
     #
-    # A failure does NOT raise. This runs after the model call, so the money is already spent
-    # and refusing now prevents nothing — it would only throw away the answer we paid for.
-    # It is remembered instead, and `check()` refuses the NEXT call, which is the first moment
-    # refusing actually saves anything.
-    if fleet_control.enabled():
-        try:
-            answer = fleet_control.record_spend(AGENT_ID, usd, detail=_task["id"])
-            with _lock:
-                _remote["broken"] = None
-                _remote["over"] = bool((answer or {}).get("over"))
-                _remote["total"] = (answer or {}).get("total")
-                _remote["ceiling"] = (answer or {}).get("ceiling")
-        except OSError as e:
-            with _lock:
-                _remote["broken"] = str(e)
-            print(f"[budget] could not record ${usd:.4f} with the fleet control plane ({e}) — "
-                  f"it is in the local ledger, and the next call will be refused until the "
-                  f"control plane answers again", flush=True)
+    # THE REMOTE WRITE IS HANDED TO THE DRAINER AND NOTHING IS WAITED ON. It used to be a
+    # synchronous POST whose failure latched "unrecorded spend", and that latch could only be
+    # cleared by a successful POST — which needed a model call, which the latch refused. One
+    # transient timeout therefore took an agent out until it was restarted, which is what
+    # happened to agent2 on 2026-08-22. The queue behind `queue_spend` retries on its own, so
+    # recovery now needs a reachable plane and nothing else.
+    fleet_control.queue_spend(AGENT_ID, usd, detail=_task["id"])
     return usd
 
 
@@ -335,21 +326,23 @@ def startup_report():
     lines += fleet_control.startup_report()
     shared = FLEET_LEDGER != LEDGER
     if fleet_control.enabled():
-        # The warning below is about a per-agent file pretending to be a fleet control. With
-        # the control plane in use that is no longer the operative risk — the plane counts
-        # every agent — so saying it anyway would train the reader to skip the block that also
-        # carries the real warnings.
-        lines.append(f"budget: fleet total and kill switch come from the control plane; "
-                     f"{LEDGER} is the local write-ahead log and {PAUSE_FILE} is the "
+        lines.append(f"budget: the kill switch and this agent's ceiling come from the control "
+                     f"plane; {LEDGER} is the local write-ahead log and {PAUSE_FILE} is the "
                      f"break-glass switch that works without a network")
     elif shared:
         lines.append(f"budget: fleet ledger {FLEET_LEDGER}, kill switch {PAUSE_FILE}")
-    else:
+    # THIS WARNING USED TO BE SUPPRESSED WHENEVER THE CONTROL PLANE WAS IN USE, on the grounds
+    # that the plane counts every agent. It does not: the plane's ceiling is PER AGENT and
+    # there is no fleet-wide tier (confirmed by the fleet owner, 2026-08-23). So with four
+    # agents the real exposure is four times this number and nothing anywhere is adding it up
+    # — which is exactly the condition this line exists to announce. Suppressing it turned a
+    # true warning into a false reassurance, which is worse than not printing it at all.
+    if not shared:
         lines.append(
-            f"WARNING: FLEET_LEDGER is this agent's own ledger, so the ${cap['fleet']:.0f} "
-            f"fleet ceiling only counts {AGENT_ID}. With N agents the fleet can spend N times "
-            f"that, and {PAUSE_FILE} pauses this container alone. Correct for a single agent; "
-            f"set FLEET_LEDGER and FLEET_PAUSE_FILE to a shared path for a fleet.")
+            f"WARNING: nothing enforces a FLEET-WIDE ceiling. ${cap['fleet']:.0f} is checked "
+            f"against {AGENT_ID}'s own ledger, and the control plane's ceiling is per-agent "
+            f"too, so N agents can spend N times this. {PAUSE_FILE} pauses this container "
+            f"alone; the plane's kill switch is the one that stops everybody.")
     return lines
 
 
@@ -383,15 +376,24 @@ def check():
     # known to be short. Refusing here is the fail-closed half of the ledger migration, and
     # this is the first moment in the call path where refusing prevents anything.
     if fleet_control.enabled():
-        with _lock:
-            broken, over, total, ceiling = (_remote["broken"], _remote["over"],
-                                            _remote["total"], _remote["ceiling"])
-        if broken:
+        view = fleet_control.spend_view()
+        over, total, ceiling = view["over"], view["total"], view["ceiling"]
+        # A GRACE WINDOW, NOT A HAIR TRIGGER. The thing worth refusing over is spend the plane
+        # has not counted for a long time, not a single failed POST — the drainer retries, so
+        # a blip clears itself in seconds without any work happening first. Refusing on the
+        # first failure is what sealed the old latch shut.
+        #
+        # It still refuses eventually, and that matters: a plane that has genuinely stopped
+        # accepting spend is a ceiling nobody is checking. `unpushed_age` is the oldest
+        # unpushed record, so a long queue that is moving does not trip it.
+        if view["unpushed_age"] > SPEND_GRACE:
             raise BudgetExceeded(
-                f"the last spend could not be recorded with the fleet control plane "
-                f"({broken}). Refusing to start another call while the fleet total is "
-                f"unknown — the work already done is in the workspace and the spend is in "
-                f"this agent's local ledger."
+                f"${view['pending_usd']:.4f} of spend has been waiting "
+                f"{view['unpushed_age'] / 60:.0f} minutes to reach the fleet control plane "
+                f"({view['error'] or 'no error reported'}). Refusing to start another call "
+                f"while the fleet total is that far behind — the work already done is in the "
+                f"workspace and the spend is in this agent's local ledger. This clears itself "
+                f"as soon as the plane answers; no restart is needed."
             )
         # Then the plane's own verdict. `over` is computed there against the authoritative
         # total across every agent, which is the number a per-box file cannot see.

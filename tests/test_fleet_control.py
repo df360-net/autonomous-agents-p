@@ -52,6 +52,7 @@ class Plane:
         self.paused = False
         self.over = False
         self.status = 200
+        self.spend_status = None                       # set to 503 to break POST /fleet/spend
         self.hits = {"pause": 0, "spend": 0, "settings": 0}
         self.settings = {"inter_agent_thread_cap": 8}
         self.last_body = None
@@ -85,6 +86,12 @@ class Plane:
                 n = int(self.headers.get("Content-Length") or 0)
                 outer.last_body = json.loads(self.rfile.read(n) or b"{}")
                 outer.hits["spend"] += 1
+                # Breakable INDEPENDENTLY of GET. The failure being reproduced took out the
+                # spend write while the kill switch kept answering, and a toggle that broke
+                # both would make the agent pause instead — a different branch entirely, and
+                # the one that already worked.
+                if outer.spend_status:
+                    return self._reply({"error": "nope"}, outer.spend_status)
                 return self._reply({"agent": outer.last_body.get("agent"), "total": 12.5,
                                     "count": 3, "ceiling": 500.0, "over": outer.over})
 
@@ -222,43 +229,45 @@ except OSError as e:
     check("  ...and the token never appears in the error", "super-secret-value" not in str(e),
           str(e))
 
-# ---- The latch: where the ledger actually becomes fail-closed ----------------
-# record() runs after the model call, so it cannot refuse a spend — the money is already gone.
-# The refusal has to land on the NEXT check(), and that seam is the thing worth testing: an
-# implementation that "fails closed" by raising inside record() would look right, throw away
-# the answer just paid for, and still not prevent a single call.
-print("\n--- the fail-closed latch ---")
+# ---- Recording a spend must never cost the agent the answer it just paid for ----------------
+# record() runs AFTER the model call, so it cannot refuse a spend — the money is already gone.
+# An implementation that "fails closed" by raising here would look right, throw away the answer
+# just paid for, and still not prevent a single call.
+#
+# THE ASSERTION THAT USED TO LIVE HERE WAS TRUE AND USELESS: "a later successful write clears
+# the latch — this recovers, it does not wedge". It does clear it. What the test never asked is
+# whether a later write could ever HAPPEN, and it could not: the latch refused the model call
+# that a write comes after. A test can pin a property and still miss the deadlock around it.
+print("\n--- recording a spend ---")
 USAGE = {"prompt_tokens": 100, "completion_tokens": 50}
 agent_budget.start_task("task-0001-test", requester="boss@agents.local")
 
 use(plane.url)
 plane.over = False
 agent_budget.record(USAGE)
-check("a spend the plane accepted leaves no latch", not agent_budget._remote["broken"])
+fleet_control.flush_spend(timeout=10)
 agent_budget.check()
-check("  ...and check() lets the next call proceed", True)
+check("a spend the plane accepted leaves the agent working", True)
 
 fleet_control.BASE_URL = f"http://127.0.0.1:{free_port()}"      # plane dies mid-task
 usd = agent_budget.record(USAGE)
 check("record() still returns the cost — the answer paid for is not thrown away", usd > 0)
 check("  ...and the spend is in the LOCAL ledger regardless",
       os.path.exists(os.environ["SPEND_LEDGER"]))
-check("  ...and a failed remote write latches", bool(agent_budget._remote["broken"]))
+check("  ...and record() does not raise when the plane is gone", True)
 try:
     agent_budget.check()
-    check("check() refuses the NEXT call while the fleet total is unknown", False, "did not raise")
+    check("ONE failed write does not stop the agent — it is retried, not latched", True)
 except agent_budget.BudgetExceeded as e:
-    check("check() refuses the NEXT call while the fleet total is unknown", True)
-    check("  ...and tells the reader the work already done is safe", "workspace" in str(e), str(e))
+    check("ONE failed write does not stop the agent — it is retried, not latched",
+          False, str(e))
 
 use(plane.url)
-agent_budget.record(USAGE)
-check("a later successful write clears the latch — this recovers, it does not wedge",
-      not agent_budget._remote["broken"])
-agent_budget.check()
+check("and the spend owed from the outage is still pushed once the plane returns",
+      fleet_control.flush_spend(timeout=10), str(fleet_control.spend_view()))
 
-# `over` is the plane's verdict against every agent's spend, which is the number no per-box
-# file can see. It must trip the break-glass switch too, so a human finds a mark.
+# `over` is the plane's verdict against this agent's recorded spend. It must trip the
+# break-glass switch too, so a human finds a mark.
 print("\n--- the plane's own ceiling verdict ---")
 try:
     os.remove(os.environ["FLEET_PAUSE_FILE"])
@@ -266,6 +275,7 @@ except OSError:
     pass
 plane.over = True
 agent_budget.record(USAGE)
+fleet_control.flush_spend(timeout=10)          # the verdict rides back on the push
 try:
     agent_budget.check()
     check("`over` from the plane stops the agent", False, "did not raise")
@@ -332,6 +342,85 @@ check("an older plane with no cap field still answers the kill switch", p is Fal
 check("  ...and the cap falls back to the local default",
       fleet_control.inter_agent_thread_cap() == fleet_control.DEFAULT_THREAD_CAP)
 plane.settings = {"inter_agent_thread_cap": 8}
+
+
+# ---- The drainer: a blip must clear itself, without any work happening first ----------------
+# THE BUG THIS PINS. A failed spend push used to latch "unrecorded spend", and the latch could
+# only be cleared by a SUCCESSFUL push — which happens only after a model call, which the latch
+# refused. One transient timeout took agent2 out until it was restarted (2026-08-22). The
+# deciding property is not "the write is async": it is that RECOVERY NEEDS A REACHABLE PLANE
+# AND NOTHING ELSE. So every assertion below is made without a single call being allowed.
+print("\n--- the spend drainer ---")
+import time                                                                   # noqa: E402
+
+use(plane.url)
+plane.over = False
+try:
+    os.remove(os.environ["FLEET_PAUSE_FILE"])         # the `over` test above left one
+except OSError:
+    pass
+fleet_control.flush_spend(timeout=5)                  # start from an empty queue
+plane.spend_status = 503                              # the plane stops taking spend
+before = plane.hits["spend"]
+fleet_control.queue_spend("dev/agent1", 0.25, detail="task-A")
+check("queueing a spend never raises, whatever the plane is doing", True)
+check("  ...and does not block the caller on the network",
+      fleet_control.spend_view()["pending"] == 1)
+
+deadline = time.time() + 5
+while fleet_control.spend_view()["error"] is None and time.time() < deadline:
+    time.sleep(0.05)
+view = fleet_control.spend_view()
+check("the failure is REMEMBERED, not swallowed", bool(view["error"]), str(view))
+check("  ...and the money is still owed to the plane",
+      view["pending"] == 1 and abs(view["pending_usd"] - 0.25) < 1e-9, str(view))
+check("  ...and it was really tried, not just queued",
+      plane.hits["spend"] > before, f"{plane.hits['spend'] - before} attempts")
+
+plane.spend_status = None                             # the plane comes back
+flushed = fleet_control.flush_spend(timeout=10)
+view = fleet_control.spend_view()
+check("RECOVERY NEEDS NOTHING BUT A REACHABLE PLANE — no model call, no restart",
+      flushed and view["pending"] == 0, str(view))
+check("  ...and the plane's verdict is picked up from the push that finally landed",
+      view["ceiling"] == 500.0 and view["over"] is False, str(view))
+
+# The grace window, from the caller's side: refuse eventually, never on the first blip.
+agent_budget.SPEND_GRACE = 300
+plane.spend_status = 503
+fleet_control.queue_spend("dev/agent1", 0.10, detail="task-B")
+deadline = time.time() + 5
+while fleet_control.spend_view()["error"] is None and time.time() < deadline:
+    time.sleep(0.05)
+try:
+    agent_budget.check()
+    blip_allowed = True
+except agent_budget.BudgetExceeded:
+    blip_allowed = False
+check("a blip does NOT stop the agent — this is the regression that bricked a pod",
+      blip_allowed)
+
+agent_budget.SPEND_GRACE = 0.01                       # pretend the outage has lasted
+time.sleep(0.05)
+try:
+    agent_budget.check()
+    stale_allowed = True
+except agent_budget.BudgetExceeded as e:
+    stale_allowed = False
+    stale_msg = str(e)
+check("spend the plane has not counted for a long time DOES stop it", not stale_allowed)
+check("  ...and says so in a way that does not send anyone looking for a restart",
+      "no restart is needed" in stale_msg, stale_msg[:120])
+
+plane.spend_status = None
+fleet_control.flush_spend(timeout=10)
+try:
+    agent_budget.check()
+    recovered = True
+except agent_budget.BudgetExceeded:
+    recovered = False
+check("and once the queue drains the agent works again, with no restart", recovered)
+agent_budget.SPEND_GRACE = 300
 
 print("\n" + ("ALL FLEET CONTROL TESTS PASSED" if all_ok else "SOME TESTS FAILED"))
 plane.stop()

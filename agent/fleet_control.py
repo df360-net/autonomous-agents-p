@@ -206,11 +206,10 @@ def _log_state(state, message):
 
 # ---- The spend ledger --------------------------------------------------------
 def record_spend(agent_id, usd, detail=None):
-    """Append one spend record. Returns the plane's view: {total, ceiling, over, ...}.
+    """Append one spend record synchronously. Returns the plane's view: {total, ceiling, over}.
 
-    Raises OSError if the write did not land. The caller must NOT let that kill the task in
-    progress — see the module docstring — but it must remember it, because an unrecorded spend
-    is an unbounded one.
+    Raises OSError if the write did not land. Kept for tests and for the drainer; the agent
+    does NOT call this on the hot path any more — see `queue_spend`.
     """
     if not enabled():
         return None
@@ -218,6 +217,119 @@ def record_spend(agent_id, usd, detail=None):
     if detail:
         payload["detail"] = detail
     return _request("POST", "/fleet/spend", payload)
+
+
+# ---- The drainer: why the push moved off the call path ------------------------
+# A SINGLE TRANSIENT TIMEOUT USED TO BRICK THE POD, and the mechanism is worth stating
+# precisely because the obvious fix does not address it. The push already ran after the model
+# call and already did not raise; what it did was latch "unrecorded spend", and the next
+# `check()` refused every call while the latch was set. The latch could only be cleared by a
+# SUCCESSFUL push, a push only happens after a model call, and no model call was allowed —
+# so the latch sealed itself and the agent refused every task until someone restarted it.
+# Reproduced with the network stubbed: one failure, then a healthy plane forever, still dead.
+#
+# So the fix is not "make the write async". It is that A FAILURE MUST BE ABLE TO CLEAR ITSELF
+# WITHOUT THE AGENT DOING WORK FIRST. That is what this thread is: it retries in the
+# background, so recovery needs a reachable plane and nothing else.
+#
+# What is deliberately NOT solved here: durability across a pod death. The queue is in memory,
+# and the local ledger is the write-ahead log that survives — which is the contract we agreed
+# (I3). A pod that dies with entries pending loses them from the REMOTE aggregate only.
+_pending = []                       # oldest first; one dict per unpushed spend
+_drain = {"thread": None, "error": None, "last_ok": 0.0,
+          "view": {"total": None, "ceiling": None, "over": False}}
+_wake = threading.Event()
+DRAIN_BACKOFF_MAX = float(os.environ.get("FLEET_DRAIN_BACKOFF_MAX", "60"))
+
+
+def queue_spend(agent_id, usd, detail=None):
+    """Hand one spend record to the drainer. Never blocks, never raises, never touches the
+    network on this thread. The caller has already written the local ledger."""
+    if not enabled():
+        return
+    with _lock:
+        _pending.append({"agent": agent_id, "amount": round(float(usd), 6),
+                         "detail": detail, "at": time.time()})
+    _ensure_drainer()
+    _wake.set()
+
+
+def _ensure_drainer():
+    with _lock:
+        if _drain["thread"] is not None and _drain["thread"].is_alive():
+            return
+        t = threading.Thread(target=_drain_loop, name="fleet-spend-drainer", daemon=True)
+        _drain["thread"] = t
+    t.start()
+
+
+def _drain_loop():
+    """Push the queue, oldest first, retrying with backoff until the plane takes it.
+
+    ONE AT A TIME AND IN ORDER, because each record carries its own task id: batching would
+    either lose that or need a new endpoint, and the volume is a few hundred small POSTs per
+    task. A permanent rejection (a 4xx that will never succeed) is not special-cased — it
+    backs off like anything else and the caller's grace window eventually refuses work, which
+    is the right outcome for a contract that is actually broken.
+    """
+    backoff = 1.0
+    while True:
+        with _lock:
+            item = _pending[0] if _pending else None
+        if item is None:
+            _wake.wait(timeout=5.0)
+            _wake.clear()
+            continue
+        try:
+            answer = record_spend(item["agent"], item["amount"], item["detail"]) or {}
+        except OSError as e:
+            with _lock:
+                _drain["error"] = str(e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, DRAIN_BACKOFF_MAX)
+            continue
+        backoff = 1.0
+        with _lock:
+            if _pending and _pending[0] is item:
+                _pending.pop(0)
+            _drain["error"] = None
+            _drain["last_ok"] = time.time()
+            _drain["view"] = {"total": answer.get("total"),
+                              "ceiling": answer.get("ceiling"),
+                              "over": bool(answer.get("over"))}
+
+
+def spend_view():
+    """What the caller needs to decide whether to keep working.
+
+    `unpushed_age` is the age of the OLDEST unpushed record, which is the only honest measure
+    of how stale the plane's copy is: a queue that is long but moving is healthy, and a queue
+    of one that has not moved for ten minutes is not.
+    """
+    now = time.time()
+    with _lock:
+        oldest = _pending[0]["at"] if _pending else None
+        return {"pending": len(_pending),
+                "pending_usd": round(sum(p["amount"] for p in _pending), 6),
+                "unpushed_age": 0.0 if oldest is None else now - oldest,
+                "error": _drain["error"],
+                "total": _drain["view"]["total"],
+                "ceiling": _drain["view"]["ceiling"],
+                "over": _drain["view"]["over"]}
+
+
+def flush_spend(timeout=10.0):
+    """Best-effort drain, for shutdown and for tests. Returns True when the queue is empty."""
+    _ensure_drainer()
+    _wake.set()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _lock:
+            if not _pending:
+                return True
+        time.sleep(0.05)
+    with _lock:
+        return not _pending
 
 
 def fleet_total(agent_id=None):

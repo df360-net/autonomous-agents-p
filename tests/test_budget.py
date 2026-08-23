@@ -318,8 +318,21 @@ check("a shared fleet ledger is reported plainly",
       any("fleet ledger" in l for l in a1.startup_report()), str(a1.startup_report()))
 solo = agent("agent-01", shared=False)
 check("A PER-AGENT FLEET LEDGER WARNS LOUDLY — it looks healthy otherwise",
-      any("WARNING" in l and "fleet ceiling only counts" in l for l in solo.startup_report()),
+      any("WARNING" in l and "FLEET-WIDE" in l for l in solo.startup_report()),
       str(solo.startup_report()))
+
+# AND IT STILL WARNS WITH A CONTROL PLANE CONFIGURED, which is the correction of 2026-08-23.
+# The warning used to be suppressed whenever FLEET_CONTROL_URL was set, on the belief that the
+# plane counted the whole fleet. It does not — its ceiling is per-agent — so the suppression
+# replaced a true warning with a false reassurance, and that is the failure mode with no other
+# symptom: everything reports healthy while N agents each spend the "fleet" ceiling.
+solo.fleet_control.BASE_URL = "http://fleet.invalid:8091"
+try:
+    check("...and STILL warns when the control plane is in use — its ceiling is per-agent too",
+          any("WARNING" in l and "FLEET-WIDE" in l for l in solo.startup_report()),
+          str(solo.startup_report()))
+finally:
+    solo.fleet_control.BASE_URL = ""
 
 shutil.rmtree(FLEET_DIR, ignore_errors=True)
 
