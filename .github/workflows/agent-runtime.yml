@@ -46,9 +46,9 @@ jobs:
           set -e
           for f in tests/test_budget.py tests/test_deliverable.py tests/test_envelope.py \
                    tests/test_fleet_control.py tests/test_gate.py tests/test_git_auth.py \
-                   tests/test_identity.py tests/test_mailflow.py tests/test_memory.py \
-                   tests/test_notes.py tests/test_peer.py tests/test_principal.py \
-                   tests/test_register.py; do
+                   tests/test_identity.py tests/test_lastmile.py tests/test_mailflow.py \
+                   tests/test_memory.py tests/test_notes.py tests/test_peer.py \
+                   tests/test_principal.py tests/test_register.py; do
             echo "== $f"
             python "$f"
           done

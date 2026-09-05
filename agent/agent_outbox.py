@@ -16,6 +16,7 @@ would notice until they went looking for a conversation that was never in their 
 import email.utils
 import mimetypes
 import os
+import re
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -107,6 +108,35 @@ def _with_boss(to, cc):
     return f"{cc}, {BOSS_ADDRESS}" if cc else BOSS_ADDRESS
 
 
+#: An address only the sender can open: loopback by name or by number, and the container's own
+#: hostname. `0.0.0.0` is in here because a server started on it gets reported as reachable there.
+_UNREACHABLE_HOST = re.compile(
+    r"""\bhttps?://(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/\S*)?""",
+    re.IGNORECASE)
+
+
+def without_unreachable_urls(body):
+    """The body with any localhost URL replaced by a phrase, plus the addresses removed.
+
+    ENFORCED HERE, IN PYTHON, FOR THE REASON THE Cc RULE IS. The prompt tells the agent not to
+    put a localhost address in an email, and an instruction is something a model can talk itself
+    out of — the reviewer that shipped one wrote "the running preview (http://localhost:3000
+    from inside this container...)", which is honest, careful, correctly disclaimed, and still
+    an invitation. `localhost` names the READER's machine. Roundcube linkifies it, the operator
+    clicks it, and gets a connection failure; the disclaimer beside a link loses to the link.
+
+    REPLACED, NOT REFUSED. The sentence around it is usually worth keeping and the work is
+    already done and paid for by the time a message is sent — bouncing the reply here would
+    lose a good answer over a phrase in it. What is left says what the address was for.
+    """
+    if not body:
+        return body, []
+    found = _UNREACHABLE_HOST.findall(body)
+    if not found:
+        return body, []
+    return _UNREACHABLE_HOST.sub("a local preview inside this container", body), found
+
+
 def new_message_id(from_addr=None):
     """A Message-ID minted BEFORE the message is built.
 
@@ -145,6 +175,13 @@ def send_mail(to, subject, body, from_name, from_addr, in_reply_to=None, referen
     if in_reply_to:
         reply["In-Reply-To"] = in_reply_to
         reply["References"] = " ".join(filter(None, [references, in_reply_to]))
+    # THE LAST PLACE A LOCALHOST ADDRESS CAN BE STOPPED, and the same argument as the boss Cc
+    # three lines up: every message the fleet sends passes through here, so the rule is applied
+    # once rather than at the three composition sites that exist today.
+    body, unreachable = without_unreachable_urls(body)
+    if unreachable:
+        log(f"removed {len(unreachable)} address(es) the recipient could not open: "
+            + ", ".join(sorted(set(unreachable))))
     reply.set_content(body)
     for name, data in attachments or []:
         ctype, _ = mimetypes.guess_type(name)

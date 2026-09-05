@@ -145,6 +145,29 @@ def cmd_scaffold(app, directory):
           f"NodePort {p['node']} (suggested — the fleet assigns the real one)\n"
           f"URL      assigned by the fleet at push; never computed here")
     print("\nStill yours to write: Dockerfile (must honour $PORT) and ci/test.sh.")
+    # SAID AT THE START, WHERE THE CODE HAS NOT BEEN WRITTEN YET. This is the one moment the
+    # advice is free: after the front end exists, "use relative URLs" is a rewrite of every
+    # fetch in it. The same paragraph is in the task notes, and both are here on purpose —
+    # scaffold is run by an agent that may never re-read the notes it was given.
+    print(_PREFIX_ADVICE)
+
+
+#: Item 2 in one paragraph. The app is served at https://apps.<fleet>/<name>/ and developed at
+#: localhost:PORT, so an absolute path is right in one place and wrong in the other, and the
+#: wrong one fails in the mode where every automated check still passes.
+_PREFIX_ADVICE = (
+    "\nRELATIVE URLS IN THE FRONT END — this one is not optional and it is not caught by any\n"
+    "test you will write. Your app is served under a PATH PREFIX in the cluster:\n"
+    "    https://apps.<fleet>/<app-name>/          not the root of a host\n"
+    "So `fetch('/api/vote')` works here on localhost and, in the cluster, asks the SITE ROOT\n"
+    "for /api/vote and gets a 404 — on a page that renders perfectly. Pod running, route\n"
+    "serving, certificate valid, tests green, and every button dead. Only a human clicking one\n"
+    "finds it.\n"
+    "    write   fetch('api/vote')     src=\"logo.png\"     href=\"about\"\n"
+    "    not     fetch('/api/vote')    src=\"/logo.png\"    href=\"/about\"\n"
+    "Relative paths resolve correctly under any prefix, including the root you develop\n"
+    "against. For links rendered on the server, read the prefix from $BASE_PATH, which the\n"
+    "platform sets in the pod.")
 
 
 def _index_for(app):
@@ -311,7 +334,72 @@ def cmd_push(app, directory, message=None):
     print(f"\npushed to github.com/{OWNER}/{repo}")
     print(f"actions: https://github.com/{OWNER}/{repo}/actions")
     print("CI has started. Poll it with:  ship_app status " + d.slug(app))
+    # THE PROMPT SAYS THIS AND THE PROMPT IS NOT A CHECK. "Every safety property lives in
+    # Python, never in the prompt" is this repository's own rule; an instruction about relative
+    # URLs is exactly the kind a model talks itself out of while writing the fetch that feels
+    # natural. So the code is read, and what would 404 under the prefix is named.
+    #
+    # AFTER THE PUSH, AND IT WARNS RATHER THAN REFUSING. Held here because the diagnosis is
+    # heuristic — a string that looks like an absolute path may be a route definition, a
+    # comment, or an external link — and blocking delivery on a guess is worse than shipping
+    # with a warning the agent and its reviewer both read.
+    for line in absolute_url_warnings(directory):
+        print(line)
     _register_with_fleet(app, directory)
+
+
+#: `fetch("/api/x")`, `src='/logo.png'`, `href="/about"`, `axios.get(`/api/x`)` — a quoted string
+#: that starts with exactly one slash, in a position that makes it a request. Two slashes is
+#: `//cdn.example.com`, a protocol-relative EXTERNAL url, and is not this bug.
+_ABSOLUTE_REQUEST = re.compile(
+    r"""(?:fetch|axios(?:\.\w+)?|open|src|href|action)\s*[=(]\s*["'`](/(?!/)[^"'`\s>]*)""")
+#: Where a front end lives — INCLUDING plain .js, which is where most of them keep their fetch
+#: calls. Leaving it out was this scanner's own version of the bug it looks for: an app with
+#: `public/app.js` would have been read as clean and shipped broken, and the page that made it
+#: look fine was `index.html`, which was scanned.
+#:
+#: Server code is not excluded by extension, because it cannot be — server.js and app.js are the
+#: same suffix. It is excluded by the VERB LIST above: `app.post('/api/vote')` declares a route
+#: and does not match, while `fetch('/api/vote')` requests one and does. That is the real
+#: filter; this tuple only keeps the walk off bundles, images and lockfiles.
+_FRONTEND_SUFFIXES = (".html", ".htm", ".js", ".mjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte")
+_SKIP_DIRS = {".git", "node_modules", "dist", "build", ".next", "vendor", "__pycache__"}
+
+
+def absolute_url_warnings(directory, limit=12):
+    """Lines naming front-end requests that will 404 under the app's path prefix.
+
+    Returns [] when there is nothing to say, so a clean app prints nothing at all.
+    """
+    found = {}
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [x for x in dirs if x not in _SKIP_DIRS]
+        for name in files:
+            if not name.endswith(_FRONTEND_SUFFIXES):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for ref in _ABSOLUTE_REQUEST.findall(text):
+                found.setdefault(ref, os.path.relpath(path, directory))
+    if not found:
+        return []
+    shown = sorted(found)[:limit]
+    lines = ["", "ABSOLUTE PATHS IN THE FRONT END — these will 404 once the app is deployed.",
+             "Your app is served at https://apps.<fleet>/<app-name>/ and not at a host root, so",
+             "a browser on that page asking for a path that starts with / asks the SITE ROOT:"]
+    for ref in shown:
+        lines.append(f"    {ref:<34} {found[ref]}")
+    if len(found) > len(shown):
+        lines.append(f"    ... and {len(found) - len(shown)} more")
+    lines += ["Drop the leading slash — 'api/vote' rather than '/api/vote' — and it resolves",
+              "under any prefix, including the root you developed against. Server-rendered",
+              "links read the prefix from $BASE_PATH. Fix and push again; nothing else about",
+              "this push failed."]
+    return lines
 
 
 def _register_with_fleet(app, directory):
@@ -372,17 +460,53 @@ def _register_with_fleet(app, directory):
                   "registration itself succeeded; governance may hold the live-address email "
                   "until a human confirms the review.)")
 
-    # The URL comes back now, but the app is not serving yet — the pod does not exist until
-    # the image does. So it is printed for the record and the agent is told not to hand it to
-    # anyone: a URL in an email is a promise someone will click, and governance sends the real
-    # one, threaded onto this task's reply, once the pod is actually ready.
+    # THE ADDRESS IS THE DELIVERABLE, and this line used to say the opposite. "Do not put this
+    # in your reply" was written against an agent that COMPUTED addresses from a host and a port
+    # offset, and it was carried over onto an address the control plane assigns and returns —
+    # which is not the same thing at all. The result was a customer who asked for an app and got
+    # a receipt, and a reviewer with nothing to check, because a promise about the future cannot
+    # be fetched.
     print(f"\nREGISTERED with the fleet control plane.")
     print(f"  target   {answer.get('target')}")
     print(f"  status   {answer.get('status')}")
-    print(f"  url      {answer.get('url')}   <- NOT LIVE YET. Do not put this in your reply.")
-    print("\nThe control plane deploys it when the image finishes building, then emails the "
-          "live address itself, in reply to this task. Say in your reply that the app is "
-          "built and registered and that the URL will follow — do not promise an address.")
+    print(f"  url      {answer.get('url')}   <- REPORT THIS ADDRESS IN YOUR REPLY, as printed.")
+    print("\nIt is the address the fleet assigned; it is not serving yet, because the pod does "
+          "not exist until the image is built. Give it in your reply and say it may take a "
+          "minute or two to start answering. Do not compute an address of your own — this is "
+          "the only one. The control plane also emails the live address itself, in reply to "
+          "this task, once the pod is actually up.")
+
+
+def _live_address_note(app, status=None):
+    """What to tell the agent about the address, at the moment it composes its reply.
+
+    ASKED, NOT REMEMBERED. `app_status` is the control plane's current view; a URL held over
+    from the registration call would be this process's memory of an answer, and the whole class
+    of bug being fixed here is an agent reporting an address that came from somewhere other
+    than the plane that assigns them.
+
+    DEGRADES TO THE INSTRUCTION, NOT TO SILENCE. If the control plane cannot be reached the
+    address still exists and `ship_app push` still printed it — so the note says to report that
+    one, rather than dropping the subject and leaving the old "the URL will follow" behaviour
+    to fill the gap by default.
+    """
+    if status is None:
+        try:
+            status = fleet_register.app_status(d.slug(app)) or {}
+        except Exception:
+            status = {}
+    url = (status or {}).get("url")
+    if not url:
+        return ("The fleet control plane deploys it from here — it was registered when you "
+                "pushed. Report the address `ship_app push` printed, exactly as printed, and "
+                "say it may take a minute or two to start serving. Do not compute one.")
+    deployed = (status or {}).get("status") == "deployed"
+    when = ("It is deployed now." if deployed else
+            "It may take a minute or two to start answering while the pod comes up.")
+    return (f"YOUR APP'S ADDRESS:  {url}\n"
+            f"{when} Put that address in your reply, exactly as printed here — it is the one "
+            f"the fleet assigned, and reporting it is not the same as inventing one. The "
+            f"control plane also emails it into this task's conversation once the pod is up.")
 
 
 def _container_port(directory):
@@ -459,10 +583,11 @@ def cmd_status(app):
         # notes: two different stories about the same pipeline is how an agent splits the
         # difference and invents a third.
         print("\nCI PASSED. The image is in the registry.")
-        print("The fleet control plane deploys it from here — it was registered when you")
-        print("pushed — and emails the live address into this task's conversation once the")
-        print("pod is actually ready. That email is not yours to send and the address is not")
-        print("yours to guess: say the app is built and registered and the URL will follow.")
+        # AND THE ADDRESS IS SAID AGAIN HERE, because this is where the agent is standing when
+        # it writes the reply — `ship_app push` printed it several minutes and a build ago.
+        # Asked from the control plane rather than remembered, so it is the address as the plane
+        # currently holds it and not one this process is reconstructing.
+        print(_live_address_note(app))
         return 0
     print(f"\nCI FAILED ({concl}). Read the log:  ship_app logs {d.slug(app)}")
     return 1

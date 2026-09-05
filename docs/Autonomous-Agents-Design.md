@@ -486,14 +486,70 @@ accounts of the same pipeline splits the difference and invents a third — and 
 
 ### What honesty requires here
 
-The agent finishes when **CI is green and the app is registered**, not when it is live. It is
-told to report the image and to describe the preview as a preview, and specifically **not** to
-curl an address it has not been given and report it as down. The plane sends the second message,
-threaded onto the agent's own reply, when the deploy lands.
+The agent finishes when **CI is green and the app is registered**, not when it is live. It
+reports the image, describes the preview as a preview, and **reports the address the control
+plane assigned** — see the four corrections below. The plane sends the second message, threaded
+onto the agent's own reply, when the deploy lands.
 
 If `GITHUB_TOKEN` is absent, the delivery instructions are replaced by an explicit *"delivery is
 unavailable, say so and do not claim to have pushed anything"*. An agent told to ship without
 credentials will otherwise report having shipped.
+
+### The last mile, and four defects in it (2026-09-04)
+
+j-fleet7 and j-fleet8 each took an email in plain English all the way to a deployed app behind a
+valid certificate. The product worked. **The last mile had four defects, and three were found
+only because a human clicked something** — every one was invisible to every automated check the
+fleet had, and two were invisible *because* of how the checks were written.
+
+**1. The agent held the address and was told to throw it away.** `ship_app` prints the URL the
+control plane assigned, and the prompt said *"do not repeat the one ship_app prints"*. So the
+customer got a receipt: *"I don't have a URL to give you yet and I won't guess one."* Correct
+under the rule, and the wrong deliverable.
+
+The rule was right about the wrong thing. It was written when the agent COMPUTED addresses from
+`APP_HOST + PROXY_PORT_BASE + slot` and emitted confident links for apps nothing had deployed.
+**Reporting an address the control plane handed you is not inventing.** The ban on computing
+stays; the ban on repeating is gone, and `ship_app status` now asks the plane for the address
+again at the moment the agent is composing its reply.
+
+The payoff is bigger than convenience. **An unverifiable promise cannot be checked.** The
+reviewer wrote *"I did not try to reach a cluster address (that would not be live yet by design
+and would prove nothing)"* while the app had been live, and broken, for two minutes — because
+the reviewer's own brief told it not to. A URL in the reply is a claim, and the reviewer tests
+claims. One fetch catches the whole of defect 2.
+
+**2. Front-end code shipped absolute URLs, and every check reported success.** Apps are served
+at `https://apps.<fleet>/<name>/`. The agent develops at `localhost:3000`, where `/api/vote` is
+correct, and ships it; in the cluster the browser asks the site root and gets a 404. Pod
+Running, Service correct, route published, `/healthz` ok, 200 on a valid certificate, CI green
+— **nothing red anywhere and the product does not work.** Every Fleet so far shipped an app in
+this state.
+
+The prompt, the `ship_app scaffold` output and the delivery note all now say to write relative
+paths and to read `$BASE_PATH` for server-rendered links. And because *every safety property
+lives in Python, never in the prompt*, `ship_app push` reads the front end and names what will
+404. It **warns rather than refusing**: the diagnosis is heuristic, and blocking delivery on a
+guess is worse than shipping with a warning the agent and the reviewer both read.
+
+**3. A `localhost` address went out in email.** *"Live behaviour on the running preview
+(http://localhost:3000 from inside this container...)"* — honest, carefully disclaimed, and
+still an invitation: the mail client linkifies it and the operator clicks it. **`localhost`
+names the reader's machine.** The prompt says not to; `send_mail` enforces it, at the one
+function every message passes through, for the same reason the boss Cc is enforced there.
+Replaced rather than refused, because the work is done and paid for by the time a reply is sent.
+
+**4. Finished and hung rendered identically.** The worker log ended on the last thing it did,
+with no terminal marker and no heartbeat, so a healthy Fleet read as a stalled one and telling
+them apart took `unseen`, a pod restart count and a timestamp window over SSH. The loop now logs
+`idle — waiting for mail (last poll HH:MM:SS)` when a task ends and every `IDLE_LOG_SECONDS`
+(default 300) after that. Not every poll: at `POLL_SECONDS=20` that is 180 lines an hour in the
+same panel an operator reads to see what the agent *did*.
+
+**What the tests here do and do not claim.** Three of the four are prompt changes, and a prompt
+is not something a test can prove works. `tests/test_lastmile.py` asserts narrowly that the
+instruction which caused each defect is gone and its replacement is present — a regression
+guard, and nothing more. The parts that are Python are tested as behaviour.
 
 ### Traps found building it
 

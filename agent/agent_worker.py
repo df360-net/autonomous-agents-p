@@ -807,8 +807,39 @@ def run_review_gate(task, result, workspace, standing=""):
 # ---- The inbox loop ---------------------------------------------------------
 def poll_once(processed):
     # One line, and it is the seam: swap agent_inbox for a broker and nothing below moves.
+    # Returns whether anything ran, so the loop can mark the moment it goes quiet — idle_line.
+    worked = False
     for envelope in agent_inbox.fetch(processed):
         run(envelope)
+        worked = True
+    return worked
+
+
+#: How often to repeat the idle line while nothing happens. NOT every poll: at POLL_SECONDS=20
+#: that is 180 lines an hour, and the panel this exists for is the same one an operator reads to
+#: see what the agent DID — burying a task's output under a heartbeat trades one unreadable
+#: panel for another. Five minutes answers "is it alive" without doing that.
+IDLE_EVERY = int(os.environ.get("IDLE_LOG_SECONDS", "300"))
+
+
+def idle_line(worked, last_logged, now, poll_at):
+    """The `idle — waiting for mail` line, or None. Pure, so the cadence can be tested.
+
+    THE PANEL COULD NOT TELL FINISHED FROM HUNG. The log ended on the last thing the worker did
+    and then stopped, which is exactly what a dead loop looks like — an operator read a healthy
+    Fleet as stalled, and separating the two took `unseen`, a pod restart count and a timestamp
+    window over SSH. Two questions, and this answers both:
+
+      "is it done?"    the line appears the moment a task ends, as a terminal marker
+      "is it alive?"   it repeats every IDLE_EVERY seconds, so silence past that is real
+
+    `last_logged is None` before anything has been said, which is why boot prints one too: a
+    worker that comes up to an empty inbox would otherwise say nothing at all.
+    """
+    if worked or last_logged is None or now - last_logged >= IDLE_EVERY:
+        stamp = time.strftime("%H:%M:%S", time.localtime(poll_at))
+        return f"idle — waiting for mail (last poll {stamp})"
+    return None
 
 
 def port_config_report(published=None):
@@ -866,13 +897,24 @@ def main():
                  + agent_budget.startup_report() + [agent_memory.status()]):
         log(line)
 
+    last_idle = None
     while True:
+        poll_at, worked = time.time(), False
         try:
-            poll_once(processed)
+            worked = poll_once(processed)
         except (agent_inbox.IMAP4.error, OSError) as e:
             log(f"mail server not reachable ({e}) — retrying in {POLL_SECONDS}s")
+            # NOT IDLE. The line below would say "waiting for mail" while the mail server is
+            # unreachable, which is the healthy-looking reading of a broken state this whole
+            # change exists to remove. The error above is the heartbeat for this cycle.
+            last_idle = poll_at
         except Exception:
             log(f"unexpected error in poll cycle:\n{traceback.format_exc()}")
+            last_idle = poll_at
+        else:
+            if line := idle_line(worked, last_idle, time.time(), poll_at):
+                log(line)
+                last_idle = time.time()
         if once:
             return
         time.sleep(POLL_SECONDS)
