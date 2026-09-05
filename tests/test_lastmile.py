@@ -189,6 +189,104 @@ assert "a local preview inside this container" in body, body
 assert "https://apps.j-fleet8.df360.net/lunchvote/" in body, "the real address must survive"
 print("PASS  a message sent through send_mail arrives with the unreachable address removed")
 
+# ---- F100: prose is not evidence -------------------------------------------------------
+# The fix above, applied to the whole assembled body, rewrote the COMMAND TRANSCRIPT. On
+# j-fleet9 both agents' evidence blocks carried
+#
+#     curl -s a local preview inside this container | grep -c "Office Coffee Tracker"
+#
+# a line that could never have executed, inside the block whose entire purpose is to let a human
+# confirm the reviewer ran what it claims. In prose the same substitution is exactly right. The
+# two are different operations, and one control was doing both.
+print("\n--- 3b. the transcript is evidence, and stays evidence ---")
+
+cmd = 'curl -s -o /dev/null -w "healthz: %{http_code}" http://localhost:3000/healthz; echo done'
+line = agent_worker.flatten(cmd)
+assert agent_outbox.PROSE_REPLACEMENT not in line, \
+    "a phrase that reads like the original command is a fabrication, not a redaction"
+assert "[localhost:3000 redacted]" in line, line
+assert "curl -s -o /dev/null" in line, "the rest of the command must survive verbatim"
+assert "redacted" in line, "the reader has to be able to tell that an edit happened"
+print("PASS  a recorded command is redacted visibly, and keeps host:port")
+
+# THE ORDERING, which is how the defect proved itself: line 22 of that same email read
+# `http://loc...` because the transcript truncated the command before the send-time scrub ran,
+# leaving a string the regex no longer matched. So one email both redacted the address and
+# printed it. A control a line break can defeat is not reliably a control.
+# THE ADDRESS HAS TO STRADDLE THE CUT, which is the whole scenario — a URL that falls entirely
+# past it simply disappears and proves nothing. `flatten`'s limit is 200, and "echo " + 173 x's
+# + " && curl -s " puts "http://" at column 190, so a cut at 200 leaves exactly `http://loc`.
+# The first version of this test used 190 x's, pushed the URL clear of the boundary, and passed
+# against the broken ordering.
+LIMIT = 200
+long_cmd = "echo " + "x" * 173 + " && curl -s http://localhost:3000/api/orders"
+assert long_cmd.index("http://") == 190 and len(long_cmd) > LIMIT, "fixture no longer straddles"
+assert "http://loc" in long_cmd[:LIMIT] and "localhost:3000" not in long_cmd[:LIMIT], \
+    "a naive cut has to leave the fragment that the old code could not match"
+cut = agent_worker.flatten(long_cmd, limit=LIMIT)
+assert "http://loc" not in cut, f"truncation must not be able to evade the redaction: {cut}"
+assert "http" not in cut, f"no fragment of an address may survive the cut: {cut}"
+# The marker itself can land under the knife, leaving `[localhost...` — which is fine: the
+# bracket still reads as an edit and the trailing `...` already says the line was cut. What
+# must never survive is a half-URL that looks like part of the command.
+assert "[localhost" in cut and cut.endswith("..."), cut
+print("PASS  redaction happens before truncation, so a cut cannot evade it")
+
+# END TO END, THROUGH THE CHOKEPOINT: prose above the boundary gets the phrase, the record
+# below it keeps its shape. Both halves in one message, because the bug was that one rule ran
+# over both.
+_FakeSMTP.sent = []
+agent_outbox.send_mail(
+    to="boss@agents.local", subject="coffee-tracker",
+    body=("I checked it on http://localhost:3000 and it works.\n"
+          "\n"
+          f"{agent_outbox.RUN_HEADER} (in order, by whom)\n"
+          f"    1. {agent_worker.flatten('curl -s http://localhost:3000/healthz')}\n"),
+    from_name="agent1", from_addr="agent1@agents.local")
+out = _FakeSMTP.sent[-1].get_content()
+prose, _, evidence = out.partition(agent_outbox.RUN_HEADER)
+assert agent_outbox.PROSE_REPLACEMENT in prose, prose
+assert "localhost" not in prose, prose
+assert "[localhost:3000 redacted]" in evidence, evidence
+assert agent_outbox.PROSE_REPLACEMENT not in evidence, \
+    "the prose phrase must not appear in the record of what ran"
+print("PASS  one message: the sentence reads naturally, the transcript reads as a transcript")
+
+# THE REGION RULE ON ITS OWN, on text that did NOT come through `flatten`. Everything above
+# reaches the outbox already redacted, so it would pass with or without the boundary — and a
+# control that cannot fail has not been shown to work. This is the case that fails without it:
+# any generated block appended by some other path, carrying a raw address.
+mixed = ("I checked http://localhost:3000 and it works.\n"
+         f"\n{agent_outbox.REVIEWER_RUN_HEADER} (in order)\n"
+         "    1. curl -s http://localhost:3000/healthz\n")
+scrubbed_mixed, found_mixed = agent_outbox.without_unreachable_urls(mixed)
+above, _, below = scrubbed_mixed.partition(agent_outbox.REVIEWER_RUN_HEADER)
+assert agent_outbox.PROSE_REPLACEMENT in above, above
+assert agent_outbox.PROSE_REPLACEMENT not in below, \
+    "the prose rule must stop at the evidence header, not run over the whole body"
+assert "http://localhost:3000/healthz" in below, "and it must leave the record alone"
+assert found_mixed == ["http://localhost:3000"], \
+    f"only the prose address is reported as removed, got {found_mixed}"
+print("PASS  the prose rule stops at the evidence header")
+
+# ONE DEFINITION OF THE BOUNDARY. The outbox looks for these headers; agent_worker writes them.
+# Written out twice, a rename in the builder would move the boundary to nowhere and silently
+# restore the defect — so the header the builder actually emits is checked against the constant
+# the matcher actually uses, on a report built by the real function.
+report = agent_worker.build_report(
+    {"stopped": "final", "answer": "Done — see http://127.0.0.1:3000 for the preview.",
+     "steps": 1, "transcript": [{"tool": "run_bash", "by": "worker",
+                                 "args": {"command": "curl -s http://localhost:3000/"}}]},
+    workspace="/tmp/ws")
+assert agent_outbox._EVIDENCE_START.search(report), \
+    "the matcher cannot find the boundary in a report the builder actually produced"
+scrubbed, _ = agent_outbox.without_unreachable_urls(report)
+head, _, tail = scrubbed.partition(agent_outbox.RUN_HEADER)
+assert agent_outbox.PROSE_REPLACEMENT in head, "the answer's own sentence is still scrubbed"
+assert "[localhost:3000 redacted]" in tail and agent_outbox.PROSE_REPLACEMENT not in tail, tail
+print("PASS  the boundary the matcher finds is the header the builder writes")
+
+print("\n--- 3c. the reviewer's brief ---")
 assert "NEVER WRITE IT IN YOUR OWN NOTES" in agent_validator.VALIDATOR_PROMPT
 # The paragraph that told the reviewer NOT to check the address. Its exact cost: "I did not try
 # to reach a cluster address (that would not be live yet by design and would prove nothing)" —

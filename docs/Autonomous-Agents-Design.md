@@ -551,6 +551,51 @@ is not something a test can prove works. `tests/test_lastmile.py` asserts narrow
 instruction which caused each defect is gone and its replacement is present — a regression
 guard, and nothing more. The parts that are Python are tested as behaviour.
 
+#### The fix to 3 rewrote the evidence (2026-09-05)
+
+`send_mail` ran the substitution over the **whole assembled body**, which includes the
+machine-generated `EVERYTHING THAT WAS RUN` and `WHAT I RAN MYSELF` blocks. Both agents on
+j-fleet9 therefore sent transcripts containing
+
+```
+curl -s a local preview inside this container | grep -c "Office Coffee Tracker"
+```
+
+**a command that could never have executed**, in the block whose entire purpose is to let a human
+confirm the reviewer ran what it claims. In prose that same substitution is exactly right — *"I
+tested on a local preview inside this container"* is what the writer meant. Inside evidence it is
+a different operation with a different meaning, and one control was doing both.
+
+Two faults, and the second is the general one:
+
+* **A redaction that reads as the original text is a fabrication.** Nothing marked the line as
+  edited, so a reader who does not notice now believes a record of something nobody ran, and a
+  reader who does notice stops trusting the whole transcript. Same family as the health dict that
+  was silent rather than wrong: the artifact looks complete, so nothing prompts anyone to check.
+* **A control a line break can defeat is not reliably a control.** One line in the same email read
+  `http://loc...` — the transcript truncates each command at 200 characters, that happened
+  *before* the send-time scrub, and the fragment no longer matched the pattern. So one message
+  both redacted an address and printed one.
+
+The rule now applies where the text is authored, in two forms, because there are two kinds of text:
+
+| | written by | gets | why |
+|---|---|---|---|
+| prose | the model | *a local preview inside this container* | the sentence is the point, and it has to read naturally |
+| evidence | the runtime | `[localhost:3000 redacted]` | it must read as an edit, keep host:port, and not be clickable |
+
+The evidence form is applied in `flatten()`, at capture, **before** the per-line truncation — which
+is what closes the ordering hole. The prose form stays at the chokepoint but stops at the first
+evidence header, because the argument for putting it there was that *a model can talk itself out
+of an instruction*, and that argument does not reach text the runtime generated.
+
+The headers that mark the boundary are defined once, in `agent_outbox`, and the report builders
+render them from those constants: written out twice, a rename in the builder would move the
+boundary to nowhere and silently restore the defect.
+
+Leaving the raw address in the transcript was the alternative — there it is evidence rather than
+an invitation — and it was rejected because mail clients linkify everywhere.
+
 ### Traps found building it
 
 - **One port, read from one place.** The generated app reads `PORT` with a default

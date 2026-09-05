@@ -73,8 +73,17 @@ strip_preamble = agent_brain.strip_preamble   # lives in the brain: it defines t
 def flatten(command, limit=200):
     """One command, one readable line. A multi-line `python3 -c "..."` used to be recorded as
     just `python3 -c "` — its first line — which told the reader exactly nothing on the one
-    email where the maths was wrong. Collapse the whitespace instead of cutting at the newline."""
-    line = " ".join((command or "").split())
+    email where the maths was wrong. Collapse the whitespace instead of cutting at the newline.
+
+    REDACTED BEFORE IT IS CUT, and the order is the point. A loopback address in a recorded
+    command is not an invitation the way one in a sentence is, but a mail client linkifies
+    everywhere, so it is marked here — visibly, as an edit, never as a phrase that could pass
+    for the command that ran. Doing it at the send, after this truncation, meant a command cut
+    at `http://loc...` no longer matched: the same email redacted one address and printed
+    another. This is the point at which the text is authored, so it is the point at which the
+    rule applies.
+    """
+    line = " ".join(agent_outbox.redact_unreachable(command).split())
     return line[:limit] + ("..." if len(line) > limit else "") or "(empty)"
 
 
@@ -134,9 +143,14 @@ def build_report(result, workspace, review=None, attach_note=""):
     if result["transcript"]:
         parts += [f"workspace: {workspace}", ""]
         if files:
-            parts += ["FILES WRITTEN", "\n".join(f"  {f}" for f in files), ""]
+            parts += [agent_outbox.FILES_HEADER,
+                      "\n".join(f"  {f}" for f in files), ""]
         parts += [
-            "EVERYTHING THAT WAS RUN (in order, by whom)",
+            # ONE DEFINITION. The outbox matches these headers to find where the model's prose
+            # stops and the runtime's own record starts, so a rename written only here would
+            # move the boundary to nowhere — and the whole body would be treated as prose
+            # again, which is the defect.
+            f"{agent_outbox.RUN_HEADER} (in order, by whom)",
             render_calls(result["transcript"]),
         ]
     body = "\n".join(parts)
@@ -197,7 +211,7 @@ def build_review_email(review, task_subject):
         parts.append("The reply you received is the corrected one.")
     if review["transcript"]:
         # No labels here — everything in this list is the reviewer's own.
-        parts += ["", "-" * 60, "WHAT I RAN MYSELF (in order)",
+        parts += ["", "-" * 60, f"{agent_outbox.REVIEWER_RUN_HEADER} (in order)",
                   render_calls(review["transcript"], label=False)]
     parts += ["", "I did not do the work; I only checked it."]
     body = "\n".join(parts)

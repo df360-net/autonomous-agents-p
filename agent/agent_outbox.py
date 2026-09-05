@@ -111,12 +111,57 @@ def _with_boss(to, cc):
 #: An address only the sender can open: loopback by name or by number, and the container's own
 #: hostname. `0.0.0.0` is in here because a server started on it gets reported as reachable there.
 _UNREACHABLE_HOST = re.compile(
-    r"""\bhttps?://(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/\S*)?""",
+    r"""\bhttps?://(?P<host>localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|::1)"""
+    r"""(?P<port>:\d+)?(?:/\S*)?""",
     re.IGNORECASE)
+
+#: The line on which the model's prose stops and the runtime's record of what ran begins. Line
+#: anchored, because these are emitted at column 0 by the report builders and a sentence that
+#: merely mentions one should not move the boundary. agent_worker writes them; the constant
+#: lives here because this module is what has to know where prose ends.
+FILES_HEADER = "FILES WRITTEN"
+RUN_HEADER = "EVERYTHING THAT WAS RUN"
+REVIEWER_RUN_HEADER = "WHAT I RAN MYSELF"
+EVIDENCE_HEADERS = (FILES_HEADER, RUN_HEADER, REVIEWER_RUN_HEADER)
+_EVIDENCE_START = re.compile(r"^(?:" + "|".join(EVIDENCE_HEADERS) + ")", re.MULTILINE)
+
+#: What the prose gets: a phrase that reads naturally in a sentence, because in prose the
+#: sentence is the point — "I tested on a local preview inside this container" is what the
+#: writer meant and what the reader needs.
+PROSE_REPLACEMENT = "a local preview inside this container"
+
+
+def _redaction(match):
+    """What EVIDENCE gets: something that reads as an edit, and keeps host:port.
+
+    A REDACTION THAT READS AS THE ORIGINAL TEXT IS A FABRICATION. Substituting the prose phrase
+    into a command transcript produced
+
+        curl -s a local preview inside this container | grep -c "Office Coffee Tracker"
+
+    — a line that could never have executed, in the block whose entire purpose is to let a human
+    confirm the reviewer ran what it claims. A reader who notices stops trusting the transcript;
+    a reader who does not now believes a record of something nobody ran. The brackets are the
+    whole fix: they say an edit happened, and the address is still named so the evidence keeps
+    its meaning. It is also not clickable, which is why the raw address is not simply left.
+    """
+    return f"[{match.group('host')}{match.group('port') or ''} redacted]"
+
+
+def redact_unreachable(text):
+    """Machine-generated text with loopback addresses marked as redacted. Idempotent.
+
+    Applied where a command is RECORDED, not where the message is sent — see `flatten` — so it
+    runs BEFORE the transcript's per-line truncation. That ordering is the bug it also fixes: a
+    command cut at 200 characters left `http://loc...`, which no longer matched, so the same
+    email both redacted the address and printed it. A control a line break can defeat is not
+    reliably a control.
+    """
+    return _UNREACHABLE_HOST.sub(_redaction, text or "")
 
 
 def without_unreachable_urls(body):
-    """The body with any localhost URL replaced by a phrase, plus the addresses removed.
+    """The PROSE of a message, with any localhost URL replaced by a phrase. Returns (body, found).
 
     ENFORCED HERE, IN PYTHON, FOR THE REASON THE Cc RULE IS. The prompt tells the agent not to
     put a localhost address in an email, and an instruction is something a model can talk itself
@@ -125,16 +170,25 @@ def without_unreachable_urls(body):
     an invitation. `localhost` names the READER's machine. Roundcube linkifies it, the operator
     clicks it, and gets a connection failure; the disclaimer beside a link loses to the link.
 
+    PROSE ONLY, AND THAT LIMIT IS THE POINT. The argument for putting this at the chokepoint was
+    that a model can talk itself out of an instruction. The appended evidence blocks are not
+    written by a model — they are the runtime's own record — so the argument does not reach
+    them, and a substitution that is right in a sentence is a different operation with a
+    different meaning inside a transcript. Those are handled at capture, by `redact_unreachable`.
+
     REPLACED, NOT REFUSED. The sentence around it is usually worth keeping and the work is
     already done and paid for by the time a message is sent — bouncing the reply here would
     lose a good answer over a phrase in it. What is left says what the address was for.
     """
     if not body:
         return body, []
-    found = _UNREACHABLE_HOST.findall(body)
+    boundary = _EVIDENCE_START.search(body)
+    end = boundary.start() if boundary else len(body)
+    prose, evidence = body[:end], body[end:]
+    found = [m.group(0) for m in _UNREACHABLE_HOST.finditer(prose)]
     if not found:
         return body, []
-    return _UNREACHABLE_HOST.sub("a local preview inside this container", body), found
+    return _UNREACHABLE_HOST.sub(PROSE_REPLACEMENT, prose) + evidence, found
 
 
 def new_message_id(from_addr=None):
