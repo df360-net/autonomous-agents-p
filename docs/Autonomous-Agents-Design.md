@@ -596,6 +596,27 @@ boundary to nowhere and silently restore the defect.
 Leaving the raw address in the transcript was the alternative — there it is evidence rather than
 an invitation — and it was rejected because mail clients linkify everywhere.
 
+**The evidence form is confirmed in production. The prose form is CLOSED WITHOUT BEING, and that is
+the right state for it rather than a gap.** A real message on `pool1` carried eight
+`[localhost:3000 redacted]` markers in its command transcript. The prose path did not fire — in that
+message or in any since — because the *instruction* worked: the agent's own sentences named no local
+address at all.
+
+Which is what a backstop is. The prose scrub exists for the case where the model talks itself out of
+an instruction, so "never observed firing in production" is its expected reading, and the only route
+to natural coverage is for the prompt to fail. Contriving a message to trigger it would show that a
+regex matches a string, which the unit tests already do at less cost and with better isolation.
+Carrying it as an open item would mean carrying one that can only be closed by a failure — a queue
+entry that quietly asks for the failure it is waiting on.
+
+The distinction worth keeping is between a control whose SUBJECT has not occurred and a control that
+has never been shown CAPABLE of firing. This one has tests that fail when the pattern is mutated, so
+it is the first kind. `resolver.py`'s ten DNS wire-parser truncation guards are the second, which is
+why they rank ahead of it and of the other thirty-six: wire-format parsing of network input is the
+one place in this system where the input is genuinely untrusted and attacker-shaped, and a guard
+that has never fired is least trustworthy where the failure mode is a malformed packet rather than a
+wrong answer.
+
 ### Traps found building it
 
 - **One port, read from one place.** The generated app reads `PORT` with a default
